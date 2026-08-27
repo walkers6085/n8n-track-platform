@@ -1,0 +1,77 @@
+services:
+  # Optional isolated n8n for track platform (port 5680). Disable if you reuse the main n8n on 5679.
+  n8n-track:
+    image: dockerhub.timeweb.cloud/n8nio/n8n:latest
+    container_name: n8n-track
+    restart: unless-stopped
+    ports:
+      - "5680:5678"
+    environment:
+      - N8N_PORT=5678
+      - N8N_DISABLE_TELEMETRY=true
+      - N8N_UI_ROOT_URL=http://localhost:5680
+      - N8N_METRICS=false
+      - N8N_ENCRYPTION_KEY=my-custom-key-123
+      - N8N_SECURE_COOKIE=false
+      - N8N_HOST=0.0.0.0
+      - WEBHOOK_URL=http://localhost:5680
+    volumes:
+      - ./data-track:/home/node/.n8n
+      - ./tracks:/tracks
+      - ./runs:/runs
+      - ./workflows:/workflows
+    profiles:
+      - isolated
+
+  backend:
+    image: python:3.11-slim
+    container_name: n8n-track-backend
+    restart: unless-stopped
+    working_dir: /app
+    command: >
+      bash -c "pip install --no-cache-dir -r backend/requirements.txt &&
+               uvicorn backend.main:app --host 0.0.0.0 --port 19001"
+    ports:
+      - "19001:19001"
+    volumes:
+      - ./backend:/app/backend
+      - ./tracks:/app/tracks
+      - ./runs:/app/runs
+      - ./config:/app/config
+      - ./frontend:/app/frontend
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:19001/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  file-server:
+    image: python:3.11-slim
+    container_name: n8n-track-file-server
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python3", "files/file_server.py"]
+    ports:
+      - "19099:19099"
+    volumes:
+      - ./files:/app/files
+      - ./tracks:/app/tracks
+      - ./runs:/app/runs
+      - ./config:/app/config
+      - ./workflows:/app/workflows
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:19099/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+# To run with isolated n8n:
+#   docker compose --profile isolated up -d
+# To run only backend + file-server (reuse main n8n on 5679):
+#   docker compose up -d backend file-server

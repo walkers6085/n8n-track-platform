@@ -1,0 +1,9 @@
+{
+  "teams": [
+    {
+      "id": "default",
+      "name": "Default Team",
+      "description": "Default team for tracks"
+    }
+  ]
+}

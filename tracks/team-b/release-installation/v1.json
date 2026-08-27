@@ -1,0 +1,259 @@
+{
+  "id": "release-installation",
+  "name": "Release Installation — Team B",
+  "version": 1,
+  "status": "draft",
+  "team": "team-b",
+  "description": "Team B variant — lightweight release flow with Slack approval and canary install.",
+  "variables": {
+    "team_id": "team-b",
+    "story_key": "",
+    "env": "staging",
+    "channel": "#releases-b",
+    "approved": false
+  },
+  "steps": [
+    {
+      "id": "get-story",
+      "type": "input",
+      "name": "Get Story",
+      "config": {
+        "prompt": "Enter Jira story key for Team B (e.g. TEAMB-100)",
+        "variable": "story_key",
+        "required": true,
+        "placeholder": "TEAMB-100"
+      },
+      "position": {
+        "x": 100,
+        "y": 100
+      }
+    },
+    {
+      "id": "read-jira",
+      "type": "jira",
+      "name": "Read Jira",
+      "config": {
+        "method": "GET",
+        "story_key": "{{variables.story_key}}",
+        "endpoint": "https://jira.example.com/rest/api/2/issue/{{variables.story_key}}",
+        "output_variable": "jira_issue"
+      },
+      "position": {
+        "x": 300,
+        "y": 100
+      }
+    },
+    {
+      "id": "validate-story",
+      "type": "validation",
+      "name": "Validate Story",
+      "config": {
+        "rules": [
+          {
+            "field": "variables.jira_issue.fields.status.name",
+            "operator": "in",
+            "value": [
+              "Ready for Release",
+              "Approved"
+            ],
+            "message": "Story must be ready"
+          }
+        ],
+        "on_failure": "fail"
+      },
+      "position": {
+        "x": 500,
+        "y": 100
+      }
+    },
+    {
+      "id": "check-env",
+      "type": "condition",
+      "name": "Check Env (Team B)",
+      "config": {
+        "expression": "variables.env == 'prod'",
+        "description": "Team B uses canary for prod"
+      },
+      "position": {
+        "x": 700,
+        "y": 100
+      }
+    },
+    {
+      "id": "approval",
+      "type": "approval",
+      "name": "Slack Approval",
+      "config": {
+        "prompt": "[Team B] Approve {{variables.story_key}} → {{variables.env}} in {{variables.channel}}?",
+        "approvers": [
+          "team-b-lead"
+        ],
+        "timeout_hours": 12,
+        "variable": "approved",
+        "channel": "{{variables.channel}}"
+      },
+      "position": {
+        "x": 900,
+        "y": 50
+      }
+    },
+    {
+      "id": "canary-install",
+      "type": "action",
+      "name": "Canary Install",
+      "config": {
+        "action": "canary_install",
+        "params": {
+          "story_key": "{{variables.story_key}}",
+          "env": "{{variables.env}}",
+          "team_id": "team-b"
+        },
+        "timeout_seconds": 600
+      },
+      "position": {
+        "x": 900,
+        "y": 200
+      }
+    },
+    {
+      "id": "install",
+      "type": "action",
+      "name": "Full Install",
+      "config": {
+        "action": "install_release",
+        "params": {
+          "story_key": "{{variables.story_key}}",
+          "env": "{{variables.env}}",
+          "team_id": "team-b"
+        },
+        "timeout_seconds": 600
+      },
+      "position": {
+        "x": 1100,
+        "y": 100
+      }
+    },
+    {
+      "id": "verify",
+      "type": "validation",
+      "name": "Verify",
+      "config": {
+        "rules": [
+          {
+            "field": "variables.install_status",
+            "operator": "equals",
+            "value": "success",
+            "message": "Install failed"
+          }
+        ],
+        "on_failure": "retry"
+      },
+      "position": {
+        "x": 1300,
+        "y": 100
+      }
+    },
+    {
+      "id": "finish",
+      "type": "message",
+      "name": "Finish",
+      "config": {
+        "text": "✅ [Team B] Release {{variables.story_key}} installed to {{variables.env}} (canary+full).",
+        "markdown": true
+      },
+      "position": {
+        "x": 1500,
+        "y": 100
+      }
+    }
+  ],
+  "transitions": [
+    {
+      "id": "t1",
+      "from": "get-story",
+      "to": "read-jira",
+      "label": "next"
+    },
+    {
+      "id": "t2",
+      "from": "read-jira",
+      "to": "validate-story",
+      "label": "fetched"
+    },
+    {
+      "id": "t3",
+      "from": "validate-story",
+      "to": "check-env",
+      "label": "valid"
+    },
+    {
+      "id": "t4",
+      "from": "check-env",
+      "to": "approval",
+      "condition": "variables.env == 'prod'",
+      "label": "prod → approval"
+    },
+    {
+      "id": "t5",
+      "from": "check-env",
+      "to": "canary-install",
+      "condition": "variables.env != 'prod'",
+      "label": "non-prod → canary"
+    },
+    {
+      "id": "t6",
+      "from": "approval",
+      "to": "canary-install",
+      "condition": "variables.approved == true",
+      "label": "approved → canary"
+    },
+    {
+      "id": "t7",
+      "from": "approval",
+      "to": "finish",
+      "condition": "variables.approved != true",
+      "label": "rejected"
+    },
+    {
+      "id": "t8",
+      "from": "canary-install",
+      "to": "install",
+      "label": "canary ok"
+    },
+    {
+      "id": "t9",
+      "from": "install",
+      "to": "verify",
+      "label": "installed"
+    },
+    {
+      "id": "t10",
+      "from": "verify",
+      "to": "finish",
+      "label": "verified"
+    }
+  ],
+  "llm_config": {
+    "provider": "mistral",
+    "model": "mistral-small-latest",
+    "temperature": 0.6,
+    "max_tokens": 1024,
+    "system_prompt": null
+  },
+  "settings": {
+    "timeout_hours": 24,
+    "max_retries": 2,
+    "allow_parallel": false
+  },
+  "integrations": {
+    "jira": {
+      "base_url": "https://jira.example.com",
+      "project": "TEAMB"
+    },
+    "slack": {
+      "channel": "#releases-b"
+    }
+  },
+  "created_at": "2026-06-01T10:00:00+00:00",
+  "updated_at": "2026-06-15T10:00:00+00:00"
+}
