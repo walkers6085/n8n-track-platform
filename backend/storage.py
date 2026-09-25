@@ -1,322 +1,316 @@
-"""Filesystem storage for tracks and runs.
+"""Filesystem JSON storage.
 
-Layout:
-  tracks/{team}/{track_id}/track.json        -- latest version
-  tracks/{team}/{track_id}/v{N}.json         -- version snapshots
-  tracks/{team}/{track_id}/versions.json     -- version index (optional)
-  runs/{team}/{run_id}.json
-  config/llm.json
-  config/teams.json
+Layout (under DATA_ROOT, the repo root by default; override with TRACK_PLATFORM_DATA):
+  tracks/{track_id}/               the partner system's format, copyable as is:
+      scheme.bpmn, tasks.json, Activity_*/{metadata,properties,attachments}.json
+      + our sidecars track.json and Activity_*/agent.json (ignored by the partner system)
+  track_versions/{track_id}/v{N}/  full immutable snapshots, runs pin one of these
+  runs/{run_id}.json
+  users/{user_id}.json             facts remembered across runs
+  config/settings.json             analyst settings (contains secrets, gitignored)
+  config/jira_mock.json            issues created in Jira "mock" mode
 """
 
 from __future__ import annotations
 
-import glob
 import json
 import logging
 import os
 import re
 import shutil
-from datetime import datetime, timezone
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-try:
-    from backend.models import Run, Track
-except ImportError:
-    from models import Run, Track  # type: ignore
+from backend.models import SECRET_FIELDS, SLUG_RE, Activity, Run, Settings, Track, TrackStatus
 
 logger = logging.getLogger(__name__)
 
-# Base directories - resolved relative to project root
-BASE_DIR = Path(__file__).resolve().parent.parent
-TRACKS_DIR = BASE_DIR / "tracks"
-RUNS_DIR = BASE_DIR / "runs"
-CONFIG_DIR = BASE_DIR / "config"
-
-_SLUG_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_root = Path(os.environ.get("TRACK_PLATFORM_DATA") or Path(__file__).resolve().parent.parent)
+_lock = threading.RLock()
 
 
-def _ensure_dirs() -> None:
-    TRACKS_DIR.mkdir(parents=True, exist_ok=True)
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+def set_root(path: Path) -> None:
+    """Point storage at another directory (tests use a temp dir)."""
+    global _root
+    _root = Path(path)
 
 
-def _validate_slug(value: str, label: str = "identifier") -> None:
-    if not _SLUG_RE.match(value):
-        raise ValueError(f"Invalid {label} '{value}': must match ^[a-zA-Z0-9_-]+$")
+def root() -> Path:
+    return _root
 
 
-def _track_dir(team: str, track_id: str) -> Path:
-    _validate_slug(team, "team")
-    _validate_slug(track_id, "track_id")
-    return TRACKS_DIR / team / track_id
+def _dir(name: str) -> Path:
+    d = _root / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def _track_file(team: str, track_id: str) -> Path:
-    return _track_dir(team, track_id) / "track.json"
+def _safe_id(value: str, label: str) -> str:
+    if not value or len(value) > 128 or not SLUG_RE.match(value):
+        raise ValueError(f"invalid {label} '{value}'")
+    return value
 
 
-def _version_file(team: str, track_id: str, version: int) -> Path:
-    return _track_dir(team, track_id) / f"v{version}.json"
-
-
-def _run_file(team: str, run_id: str) -> Path:
-    # run_id may contain broader chars but must not allow path traversal
-    if "/" in run_id or "\\" in run_id or ".." in run_id:
-        raise ValueError(f"Invalid run_id '{run_id}'")
-    return RUNS_DIR / team / f"{run_id}.json"
-
-
-# ---------------------------------------------------------------------------
-# Track operations
-# ---------------------------------------------------------------------------
-
-def load_track(team: str, track_id: str, version: Optional[int] = None) -> Track:
-    """Load a track. If version is None, loads latest (track.json)."""
-    _ensure_dirs()
-    if version is not None:
-        path = _version_file(team, track_id, version)
-    else:
-        path = _track_file(team, track_id)
-    if not path.exists():
-        raise FileNotFoundError(f"Track not found: {team}/{track_id}" + (f" v{version}" if version else ""))
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return Track.model_validate(data)
-
-
-def save_track(track: Track) -> Track:
-    """Save track to filesystem. Creates version snapshot.
-
-    If the track already exists and content changed, increments version.
-    Caller may also set track.version explicitly.
-    """
-    _ensure_dirs()
-    tdir = _track_dir(track.team, track.id)
-    tdir.mkdir(parents=True, exist_ok=True)
-
-    track.touch()
-
-    # Determine if we need to bump version: if file exists, compare version
-    dest = _track_file(track.team, track.id)
-    if dest.exists():
-        try:
-            existing = Track.model_validate(json.loads(dest.read_text(encoding="utf-8")))
-            # If caller did not bump version, auto-increment when content differs
-            if track.version <= existing.version:
-                # Only bump if data actually changed (avoid spurious bumps)
-                old = existing.model_dump(exclude={"updated_at", "created_at"})
-                new = track.model_dump(exclude={"updated_at", "created_at"})
-                if old != new:
-                    track.version = existing.version + 1
-                else:
-                    track.version = existing.version
-        except Exception:
-            # If existing file is corrupt, overwrite
-            pass
-
-    # Write latest
-    with open(dest, "w", encoding="utf-8") as f:
-        json.dump(track.model_dump(mode="json"), f, indent=2, ensure_ascii=False)
-
-    # Write version snapshot
-    vpath = _version_file(track.team, track.id, track.version)
-    with open(vpath, "w", encoding="utf-8") as f:
-        json.dump(track.model_dump(mode="json"), f, indent=2, ensure_ascii=False)
-
-    logger.info("Saved track %s/%s v%d", track.team, track.id, track.version)
-    return track
-
-
-def create_version(team: str, track_id: str) -> Track:
-    """Explicitly snapshot current track.json into next version file."""
-    track = load_track(team, track_id)
-    next_version = track.version + 1
-    track.version = next_version
-    track.touch()
-    # update latest
-    dest = _track_file(team, track_id)
-    with open(dest, "w", encoding="utf-8") as f:
-        json.dump(track.model_dump(mode="json"), f, indent=2, ensure_ascii=False)
-    vpath = _version_file(team, track_id, next_version)
-    with open(vpath, "w", encoding="utf-8") as f:
-        json.dump(track.model_dump(mode="json"), f, indent=2, ensure_ascii=False)
-    logger.info("Created version %d for %s/%s", next_version, team, track_id)
-    return track
-
-
-def list_tracks(team: Optional[str] = None) -> List[Track]:
-    """List all tracks, optionally filtered by team."""
-    _ensure_dirs()
-    result: List[Track] = []
-    if team:
-        pattern = str(TRACKS_DIR / team / "*" / "track.json")
-    else:
-        pattern = str(TRACKS_DIR / "*" / "*" / "track.json")
-    for path in glob.glob(pattern):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            result.append(Track.model_validate(data))
-        except Exception as e:
-            logger.warning("Skipping invalid track file %s: %s", path, e)
-    # Sort by team, id
-    result.sort(key=lambda t: (t.team, t.id))
-    return result
-
-
-def list_versions(team: str, track_id: str) -> List[int]:
-    """Return sorted list of available version numbers for a track."""
-    _ensure_dirs()
-    tdir = _track_dir(team, track_id)
-    if not tdir.exists():
-        raise FileNotFoundError(f"Track not found: {team}/{track_id}")
-    versions: List[int] = []
-    for p in tdir.glob("v*.json"):
-        m = re.match(r"v(\d+)\.json", p.name)
-        if m:
-            versions.append(int(m.group(1)))
-    versions.sort()
-    return versions
-
-
-def delete_track(team: str, track_id: str) -> None:
-    tdir = _track_dir(team, track_id)
-    if not tdir.exists():
-        raise FileNotFoundError(f"Track not found: {team}/{track_id}")
-    shutil.rmtree(tdir)
-    logger.info("Deleted track %s/%s", team, track_id)
-
-
-# ---------------------------------------------------------------------------
-# Run operations
-# ---------------------------------------------------------------------------
-
-def load_run(team: str, run_id: str) -> Run:
-    _ensure_dirs()
-    # Try team-specific path first, then search all teams
-    path = _run_file(team, run_id)
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return Run.model_validate(data)
-    # Fallback: search under runs/*/
-    for candidate in RUNS_DIR.glob(f"*/{run_id}.json"):
-        with open(candidate, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return Run.model_validate(data)
-    raise FileNotFoundError(f"Run not found: {run_id}")
-
-
-def load_run_any(run_id: str) -> Run:
-    """Load run without knowing team."""
-    _ensure_dirs()
-    for candidate in RUNS_DIR.glob(f"*/{run_id}.json"):
-        with open(candidate, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return Run.model_validate(data)
-    # Also try flat
-    flat = RUNS_DIR / f"{run_id}.json"
-    if flat.exists():
-        with open(flat, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return Run.model_validate(data)
-    raise FileNotFoundError(f"Run not found: {run_id}")
-
-
-def save_run(run: Run) -> Run:
-    _ensure_dirs()
-    run.touch()
-    path = _run_file(run.team, run.run_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(run.model_dump(mode="json"), f, indent=2, ensure_ascii=False)
-    logger.info("Saved run %s team=%s status=%s", run.run_id, run.team, run.status)
-    return run
-
-
-def list_runs(team: Optional[str] = None, user_id: Optional[str] = None) -> List[Run]:
-    _ensure_dirs()
-    result: List[Run] = []
-    if team:
-        pattern = str(RUNS_DIR / team / "*.json")
-    else:
-        pattern = str(RUNS_DIR / "*" / "*.json")
-        # also include flat files
-        for p in RUNS_DIR.glob("*.json"):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                r = Run.model_validate(data)
-                if user_id and r.user_id != user_id:
-                    continue
-                result.append(r)
-            except Exception as e:
-                logger.warning("Skipping invalid run file %s: %s", p, e)
-    for path in glob.glob(pattern):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            r = Run.model_validate(data)
-            if user_id and r.user_id != user_id:
-                continue
-            result.append(r)
-        except Exception as e:
-            logger.warning("Skipping invalid run file %s: %s", path, e)
-    # Most recent first
-    result.sort(key=lambda r: r.created_at, reverse=True)
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Config operations
-# ---------------------------------------------------------------------------
-
-def load_llm_config() -> Dict[str, Any]:
-    _ensure_dirs()
-    path = CONFIG_DIR / "llm.json"
-    if not path.exists():
-        return {
-            "provider": "mistral",
-            "model": "mistral-small-latest",
-            "temperature": 0.7,
-            "api_key_configured": False,
-            "base_url": None,
-            "max_tokens": None,
-            "extra": {},
-        }
+def _read(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_llm_config(data: Dict[str, Any]) -> Dict[str, Any]:
-    _ensure_dirs()
-    path = CONFIG_DIR / "llm.json"
-    with open(path, "w", encoding="utf-8") as f:
+def _write(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Tracks — the partner system's folder layout, see models.Track
+# ---------------------------------------------------------------------------
+
+PARTNER_FILES = ("metadata.json", "properties.json", "attachments.json")
+
+
+def _track_dir(track_id: str) -> Path:
+    return _dir("tracks") / _safe_id(track_id, "track id")
+
+
+def _version_dir(track_id: str, version: int) -> Path:
+    return _dir("track_versions") / _safe_id(track_id, "track id") / f"v{int(version)}"
+
+
+def _compact(data: Any) -> str:
+    # the partner system writes one-line JSON with raw UTF-8
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def read_track_dir(d: Path) -> Track:
+    """Read a track folder. Works for folders exported by the partner system (no track.json)."""
+    from backend import bpmn
+
+    scheme = d / "scheme.bpmn"
+    if not scheme.exists():
+        raise FileNotFoundError(f"нет {scheme.name} в {d.name}")
+    xml = scheme.read_text(encoding="utf-8")
+    meta = _read(d / "track.json") if (d / "track.json").exists() else {}
+    tasks = _read(d / "tasks.json") if (d / "tasks.json").exists() else []
+    activities: Dict[str, Activity] = {}
+    for sub in sorted(p for p in d.iterdir() if p.is_dir()):
+        if not (sub / "metadata.json").exists():
+            continue
+        act = {"metadata": _read(sub / "metadata.json")}
+        for name, key in (("properties.json", "properties"), ("attachments.json", "attachments"),
+                          ("agent.json", "agent")):
+            if (sub / name).exists():
+                act[key] = _read(sub / name)
+        activities[sub.name] = Activity.model_validate(act)
+    if not meta:
+        g = bpmn.parse(xml)
+        track_uuid = next((p.get("trackId") for a in activities.values() for p in a.properties
+                           if p.get("trackId")), None)
+        meta = {"id": d.name, "name": g.process_name or d.name, "status": "draft"}
+        if track_uuid:
+            meta["track_uuid"] = track_uuid
+    meta["id"] = meta.get("id") or d.name
+    return Track.model_validate({**meta, "bpmn": xml, "tasks": tasks, "activities": activities})
+
+
+def write_track_dir(track: Track, d: Path) -> None:
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "scheme.bpmn").write_text(track.bpmn, encoding="utf-8")
+    (d / "tasks.json").write_text(_compact(track.tasks), encoding="utf-8")
+    _write(d / "track.json", track.meta().model_dump(mode="json"))
+    keep = set(track.activities)
+    for tid, act in track.activities.items():
+        sub = d / _safe_id(tid, "activity id")
+        sub.mkdir(exist_ok=True)
+        (sub / "metadata.json").write_text(_compact(act.metadata), encoding="utf-8")
+        (sub / "properties.json").write_text(_compact(act.properties), encoding="utf-8")
+        (sub / "attachments.json").write_text(_compact(act.attachments), encoding="utf-8")
+        agent = act.agent.model_dump(mode="json", exclude_defaults=True)
+        if agent:
+            _write(sub / "agent.json", agent)
+        elif (sub / "agent.json").exists():
+            (sub / "agent.json").unlink()
+    for sub in d.iterdir():  # activities removed from the scheme
+        if sub.is_dir() and sub.name not in keep and (sub / "metadata.json").exists():
+            shutil.rmtree(sub)
+
+
+def load_track(track_id: str, version: Optional[int] = None) -> Track:
+    d = _version_dir(track_id, version) if version else _track_dir(track_id)
+    if not (d / "scheme.bpmn").exists():
+        raise FileNotFoundError(f"track {track_id}" + (f" v{version}" if version else ""))
+    return read_track_dir(d)
+
+
+def _content(track: Track) -> Dict[str, Any]:
+    data = track.model_dump(mode="json", exclude={"created_at", "updated_at", "version"})
+    data["bpmn"] = track.bpmn.strip()
     return data
 
 
-def load_teams() -> List[Dict[str, Any]]:
-    _ensure_dirs()
-    path = CONFIG_DIR / "teams.json"
+def save_track(track: Track) -> Track:
+    """Write the track folder and a full snapshot. The version goes up only when content changed."""
+    with _lock:
+        d = _track_dir(track.id)
+        if (d / "scheme.bpmn").exists():
+            old = read_track_dir(d)
+            if _content(old) == _content(track):
+                return old
+            track.version = old.version + 1
+            track.created_at = old.created_at
+        track.touch()
+        write_track_dir(track, d)
+        snap = _version_dir(track.id, track.version)
+        if snap.exists():
+            shutil.rmtree(snap)
+        write_track_dir(track, snap)
+        logger.info("saved track %s v%d", track.id, track.version)
+        return read_track_dir(d)
+
+
+def list_tracks(status: Optional[TrackStatus] = None) -> List[Track]:
+    out: List[Track] = []
+    for p in sorted(_dir("tracks").glob("*/scheme.bpmn")):
+        try:
+            t = read_track_dir(p.parent)
+        except Exception as e:  # a broken track must not hide the other tracks
+            logger.warning("skip %s: %s", p.parent, e)
+            continue
+        if status is None or t.status == status:
+            out.append(t)
+    return out
+
+
+def list_versions(track_id: str) -> List[int]:
+    if not (_track_dir(track_id) / "scheme.bpmn").exists():
+        raise FileNotFoundError(f"track {track_id}")
+    vdir = _dir("track_versions") / _safe_id(track_id, "track id")
+    return sorted(int(m.group(1)) for p in (vdir.glob("v*") if vdir.exists() else [])
+                  if (m := re.fullmatch(r"v(\d+)", p.name)))
+
+
+def delete_track(track_id: str) -> None:
+    d = _track_dir(track_id)
+    if not (d / "scheme.bpmn").exists():
+        raise FileNotFoundError(f"track {track_id}")
+    shutil.rmtree(d)
+    vdir = _dir("track_versions") / _safe_id(track_id, "track id")
+    if vdir.exists():
+        shutil.rmtree(vdir)
+
+
+# ---------------------------------------------------------------------------
+# Runs
+# ---------------------------------------------------------------------------
+
+_run_locks: Dict[str, threading.Lock] = {}
+
+
+def run_lock(run_id: str) -> threading.Lock:
+    """One agent turn at a time per run."""
+    with _lock:
+        return _run_locks.setdefault(run_id, threading.Lock())
+
+
+def _run_path(run_id: str) -> Path:
+    return _dir("runs") / f"{_safe_id(run_id, 'run id')}.json"
+
+
+def load_run(run_id: str) -> Run:
+    path = _run_path(run_id)
     if not path.exists():
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    # Normalize: support both list and dict formats
-    if isinstance(data, dict) and "teams" in data:
-        return data["teams"]
-    if isinstance(data, list):
+        raise FileNotFoundError(f"run {run_id}")
+    return Run.model_validate(_read(path))
+
+
+def save_run(run: Run) -> Run:
+    run.touch()
+    _write(_run_path(run.run_id), run.model_dump(mode="json"))
+    return run
+
+
+def list_runs(user_id: Optional[str] = None, track_id: Optional[str] = None) -> List[Run]:
+    out: List[Run] = []
+    for p in _dir("runs").glob("*.json"):
+        try:
+            r = Run.model_validate(_read(p))
+        except Exception as e:
+            logger.warning("skip %s: %s", p, e)
+            continue
+        if user_id and r.user_id != user_id:
+            continue
+        if track_id and r.track_id != track_id:
+            continue
+        out.append(r)
+    out.sort(key=lambda r: r.updated_at, reverse=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# User profile memory
+# ---------------------------------------------------------------------------
+
+def _user_path(user_id: str) -> Path:
+    return _dir("users") / f"{_safe_id(user_id, 'user id')}.json"
+
+
+def load_profile(user_id: str) -> Dict[str, Any]:
+    path = _user_path(user_id)
+    return _read(path) if path.exists() else {}
+
+
+def update_profile(user_id: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    with _lock:
+        data = load_profile(user_id)
+        data.update(facts)
+        _write(_user_path(user_id), data)
         return data
-    return []
 
 
-def save_teams(data: Any) -> Any:
-    _ensure_dirs()
-    path = CONFIG_DIR / "teams.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+def _settings_path() -> Path:
+    return _dir("config") / "settings.json"
+
+
+def load_settings() -> Settings:
+    path = _settings_path()
+    s = Settings.model_validate(_read(path)) if path.exists() else Settings()
+    if not s.agent.api_key:
+        s.agent.api_key = os.environ.get("AGENT_API_KEY") or os.environ.get("MISTRAL_API_KEY", "")
+    return s
+
+
+def save_settings(new: Settings) -> Settings:
+    """Secrets sent back empty or masked keep their stored value."""
+    with _lock:
+        path = _settings_path()
+        old = Settings.model_validate(_read(path)) if path.exists() else Settings()
+        for section, field in SECRET_FIELDS:
+            val = getattr(getattr(new, section), field)
+            if not val or set(val) == {"•"}:
+                setattr(getattr(new, section), field, getattr(getattr(old, section), field))
+        _write(path, new.model_dump(mode="json"))
+        return new
+
+
+def public_settings(s: Settings) -> Dict[str, Any]:
+    data = s.model_dump(mode="json")
+    for section, field in SECRET_FIELDS:
+        data[section][f"{field}_set"] = bool(data[section][field])
+        data[section][field] = "••••••••" if data[section][field] else ""
     return data
+
+
+def load_json(name: str, default: Any) -> Any:
+    path = _dir("config") / name
+    return _read(path) if path.exists() else default
+
+
+def save_json(name: str, data: Any) -> None:
+    _write(_dir("config") / name, data)

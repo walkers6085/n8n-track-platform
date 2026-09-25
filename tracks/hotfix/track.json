@@ -1,0 +1,12 @@
+{
+  "id": "hotfix",
+  "name": "Хотфикс",
+  "description": "Быстрый выпуск исправления в прод: инцидент, заявка, установка, проверка.",
+  "status": "published",
+  "version": 1,
+  "track_uuid": "25296ec3-8532-4e86-bed8-1becd8885ace",
+  "agent_instructions": "",
+  "model": "",
+  "created_at": "2026-09-25T09:03:05.392457+00:00",
+  "updated_at": "2026-09-25T09:03:05.392457+00:00"
+}

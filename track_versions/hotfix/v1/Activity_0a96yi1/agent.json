@@ -1,0 +1,7 @@
+{
+  "jira": {
+    "project": "REL",
+    "summary": "Хотфикс по {incident_key}",
+    "description": "Проблема: {problem}\nСрочность: {severity}"
+  }
+}

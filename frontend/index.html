@@ -1,152 +1,20 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="ru">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>n8n Track Platform</title>
-<link rel="stylesheet" href="style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Треки</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%233b5bdb'/><path d='M9 10h14M9 16h10M9 22h6' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>">
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="topbar">
-  <h1>n8n Track Platform</h1>
-  <nav class="tabs">
-    <button class="tab active" data-view="run">Run</button>
-    <button class="tab" data-view="admin">Admin</button>
-    <a class="tab" href="/docs" target="_blank" style="text-decoration:none">API docs</a>
-  </nav>
-</header>
-
-<!-- RUN VIEW -->
-<div id="view-run" class="view active">
-  <div class="layout">
-    <!-- LEFT: track list -->
-    <div class="panel" id="panel-tracks">
-      <div class="panel-head">
-        <span>Tracks</span>
-        <button class="btn btn-sm" id="btn-refresh-tracks">Refresh</button>
-      </div>
-      <div class="panel-body" id="track-list">
-        <p class="muted">Loading tracks...</p>
-      </div>
-      <div class="panel-footer">
-        <input id="filter-team" placeholder="Filter team" style="flex:1;padding:6px 8px;border:1px solid #e2e4e7;border-radius:6px;font-size:.82rem">
-      </div>
-    </div>
-
-    <!-- CENTER: chat -->
-    <div class="panel" id="panel-chat">
-      <div class="panel-head">
-        <span id="chat-title">Select a track to start</span>
-        <span id="run-status" class="badge hidden"></span>
-      </div>
-      <div class="panel-body">
-        <div id="messages" class="messages">
-          <p class="muted" id="empty-chat">No run yet. Pick a track on the left and click Start.</p>
-        </div>
-      </div>
-      <div class="panel-footer" id="chat-input-row">
-        <input id="chat-input" class="chat-input" placeholder="Type a message..." disabled>
-        <button id="btn-send" class="btn btn-primary" disabled>Send</button>
-      </div>
-      <div style="padding:6px 10px;display:flex;gap:6px;flex-wrap:wrap">
-        <button id="btn-start" class="btn btn-primary btn-sm" disabled>Start run</button>
-        <button id="btn-advance" class="btn btn-sm hidden">Advance (n8n)</button>
-        <span id="run-id-label" class="muted" style="align-self:center"></span>
-      </div>
-    </div>
-
-    <!-- RIGHT: progress -->
-    <div class="panel" id="panel-progress">
-      <div class="panel-head">Progress</div>
-      <div class="panel-body">
-        <div id="steps-list"><p class="muted">No track selected.</p></div>
-        <h4 style="margin:12px 0 6px;font-size:.82rem">Variables</h4>
-        <div class="vars-box"><pre id="vars-display">{}</pre></div>
-        <h4 style="margin:12px 0 6px;font-size:.82rem">History</h4>
-        <div id="history-mini" class="muted" style="font-size:.78rem"></div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- ADMIN VIEW -->
-<div id="view-admin" class="view view-admin">
-  <div class="admin-section">
-    <h2>Tracks</h2>
-    <div id="admin-track-list" class="track-list-admin"><p class="muted" style="padding:10px">Loading...</p></div>
-    <div style="margin-top:10px;display:flex;gap:8px">
-      <button id="btn-new-track" class="btn btn-primary btn-sm">+ New Track</button>
-      <button id="btn-refresh-admin" class="btn btn-sm">Refresh</button>
-    </div>
-  </div>
-
-  <div class="admin-section" id="admin-editor" style="display:none">
-    <h2 id="editor-title">Edit Track</h2>
-    <div class="form-grid">
-      <div><label>ID (slug)</label><input id="ed-id" placeholder="my-track"></div>
-      <div><label>Team</label><input id="ed-team" placeholder="team-a"></div>
-      <div><label>Name</label><input id="ed-name" placeholder="My Track"></div>
-      <div><label>Status</label>
-        <select id="ed-status">
-          <option value="draft">draft</option>
-          <option value="published">published</option>
-          <option value="archived">archived</option>
-        </select>
-      </div>
-      <div class="full"><label>Description</label><textarea id="ed-desc" placeholder="Description"></textarea></div>
-      <div class="full"><label>Steps (JSON array)</label><textarea id="ed-steps" rows="8" placeholder='[{"id":"s1","type":"message","config":{"text":"Hello"}}]'></textarea></div>
-      <div class="full"><label>Transitions (JSON array)</label><textarea id="ed-transitions" rows="5" placeholder='[{"from":"s1","to":"s2"}]'></textarea></div>
-      <div class="full"><label>Variables (JSON object)</label><textarea id="ed-vars" rows="3" placeholder='{"env":"staging"}'></textarea></div>
-      <div class="full"><label>LLM Config (JSON, optional)</label><textarea id="ed-llm" rows="3" placeholder='{"provider":"mistral","model":"mistral-small-latest","temperature":0.7}'></textarea></div>
-    </div>
-    <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-      <button id="btn-save-track" class="btn btn-primary">Save</button>
-      <button id="btn-publish" class="btn">Publish version</button>
-      <button id="btn-delete-track" class="btn" style="color:#d92d20;border-color:#fecdca">Delete</button>
-      <button id="btn-cancel-edit" class="btn">Cancel</button>
-    </div>
-    <p class="muted" style="margin-top:6px">Version is auto-incremented on save when content changes.</p>
-    <div style="margin-top:14px">
-      <h3 style="font-size:.9rem;margin-bottom:6px">Graph</h3>
-      <div class="graph-wrap" id="graph-wrap">
-        <svg id="graph-svg" viewBox="0 0 900 320" preserveAspectRatio="xMidYMid meet">
-          <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#98a2b3"/></marker></defs>
-        </svg>
-      </div>
-    </div>
-    <div style="margin-top:10px">
-      <h3 style="font-size:.9rem;margin-bottom:6px">Step cards</h3>
-      <div id="step-cards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px"></div>
-    </div>
-    <div style="margin-top:10px">
-      <h3 style="font-size:.9rem;margin-bottom:6px">Transitions editor</h3>
-      <div id="transitions-editor"></div>
-      <button id="btn-add-transition" class="btn btn-sm" style="margin-top:6px">+ Add transition</button>
-    </div>
-  </div>
-
-  <div class="admin-section">
-    <h2>LLM Config</h2>
-    <p class="muted" style="margin-bottom:8px">Global LLM settings (inherited by tracks/steps). Track llm_config overrides these.</p>
-    <div class="form-grid">
-      <div><label>Provider</label><input id="llm-provider" value="mistral"></div>
-      <div><label>Model</label><input id="llm-model" value="mistral-small-latest"></div>
-      <div><label>Temperature</label><input id="llm-temp" type="number" step="0.1" min="0" max="2" value="0.7"></div>
-      <div><label>Max tokens</label><input id="llm-max" type="number" placeholder="empty = default"></div>
-      <div><label>Base URL</label><input id="llm-base" placeholder="https://api.mistral.ai/v1"></div>
-      <div><label>API key configured</label>
-        <select id="llm-key"><option value="false">false</option><option value="true">true</option></select>
-      </div>
-    </div>
-    <div style="margin-top:10px;display:flex;gap:8px">
-      <button id="btn-save-llm" class="btn btn-primary">Save LLM config</button>
-      <button id="btn-load-llm" class="btn btn-sm">Reload</button>
-    </div>
-    <p class="muted" style="margin-top:6px">Inheritance: Global -&gt; Team -&gt; Track -&gt; Step (step config.llm overrides track).</p>
-  </div>
-</div>
-
-<div id="toast" class="toast"></div>
-<script src="app.js"></script>
+  <header class="topbar">
+    <a class="brand" href="#/"><span class="logo">≡</span>Треки</a>
+    <span class="spacer"></span>
+    <button class="ghost" id="who" title="Сменить имя"></button>
+  </header>
+  <main id="app"></main>
+  <script src="common.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

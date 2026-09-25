@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="rollback" name="rollback" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_1">
+      <bpmn:outgoing>Flow_048b4rv</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Activity_021a1gi" name="Причина отката" camunda:type="external" camunda:topic="xray">
+      <bpmn:extensionElements>
+        <camunda:property name="taskType" value="task" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_048b4rv</bpmn:incoming>
+      <bpmn:outgoing>Flow_1wwtgom</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Activity_0an8isl" name="Подтверждение" camunda:type="external" camunda:topic="xray">
+      <bpmn:extensionElements>
+        <camunda:property name="taskType" value="task" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_1wwtgom</bpmn:incoming>
+      <bpmn:outgoing>Flow_1wdsb9b</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Activity_0531f93" name="Откат" camunda:type="external" camunda:topic="xray">
+      <bpmn:extensionElements>
+        <camunda:property name="taskType" value="task" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_1wdsb9b</bpmn:incoming>
+      <bpmn:outgoing>Flow_0p2dje7</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="Event_0o843f9">
+      <bpmn:incoming>Flow_0p2dje7</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_048b4rv" sourceRef="StartEvent_1" targetRef="Activity_021a1gi" />
+    <bpmn:sequenceFlow id="Flow_1wwtgom" sourceRef="Activity_021a1gi" targetRef="Activity_0an8isl" />
+    <bpmn:sequenceFlow id="Flow_1wdsb9b" sourceRef="Activity_0an8isl" targetRef="Activity_0531f93" />
+    <bpmn:sequenceFlow id="Flow_0p2dje7" sourceRef="Activity_0531f93" targetRef="Event_0o843f9" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="rollback">
+      <bpmndi:BPMNShape id="StartEvent_1_di" bpmnElement="StartEvent_1">
+        <dc:Bounds x="132" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_021a1gi_di" bpmnElement="Activity_021a1gi">
+        <dc:Bounds x="270" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_0an8isl_di" bpmnElement="Activity_0an8isl">
+        <dc:Bounds x="440" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_0531f93_di" bpmnElement="Activity_0531f93">
+        <dc:Bounds x="610" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Event_0o843f9_di" bpmnElement="Event_0o843f9">
+        <dc:Bounds x="982" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_048b4rv_di" bpmnElement="Flow_048b4rv">
+        <di:waypoint x="168" y="120" />
+        <di:waypoint x="270" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1wwtgom_di" bpmnElement="Flow_1wwtgom">
+        <di:waypoint x="370" y="120" />
+        <di:waypoint x="440" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1wdsb9b_di" bpmnElement="Flow_1wdsb9b">
+        <di:waypoint x="540" y="120" />
+        <di:waypoint x="610" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0p2dje7_di" bpmnElement="Flow_0p2dje7">
+        <di:waypoint x="710" y="120" />
+        <di:waypoint x="982" y="120" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

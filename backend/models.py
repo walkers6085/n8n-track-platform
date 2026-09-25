@@ -1,17 +1,33 @@
-"""Pydantic models for n8n Track Platform."""
+"""Pydantic models: tracks (what the analyst builds), runs (a user's pass through a track),
+settings (what the analyst configures)."""
 
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+
+SLUG_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _slug(v: str) -> str:
+    if not v or not SLUG_RE.match(v):
+        raise ValueError("must match ^[a-zA-Z0-9_-]+$")
+    return v
 
 
 # ---------------------------------------------------------------------------
-# Enums
+# Track — stored in the partner system's format:
+#   scheme.bpmn, tasks.json, Activity_*/{metadata,properties,attachments}.json (kept verbatim)
+# plus our sidecars that the partner system ignores: track.json and Activity_*/agent.json
 # ---------------------------------------------------------------------------
 
 class TrackStatus(str, Enum):
@@ -20,194 +36,278 @@ class TrackStatus(str, Enum):
     archived = "archived"
 
 
-class RunStatus(str, Enum):
-    active = "active"
-    waiting = "waiting"
-    completed = "completed"
-    failed = "failed"
-    cancelled = "cancelled"
+class Link(BaseModel):
+    title: str = ""
+    url: str
+    # who the document is for: the agent reads all of them, "user"/"both" are also shown to the user
+    audience: Literal["agent", "user", "both"] = "both"
+
+    @field_validator("url")
+    @classmethod
+    def http_only(cls, v: str) -> str:
+        v = v.strip()
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("link url must start with http:// or https://")
+        return v
 
 
-class StepType(str, Enum):
-    message = "message"
-    input = "input"
-    question = "question"
-    jira = "jira"
-    validation = "validation"
-    action = "action"
-    condition = "condition"
-    approval = "approval"
-    llm = "llm"
-    webhook = "webhook"
-    wait = "wait"
-
-
-# ---------------------------------------------------------------------------
-# Step / Transition / Track
-# ---------------------------------------------------------------------------
-
-STEP_TYPES = {e.value for e in StepType}
-
-_SLUG_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
-
-
-class Step(BaseModel):
-    id: str = Field(..., description="Unique step identifier within the track")
-    type: StepType = Field(..., description="Step type")
-    name: Optional[str] = None
-    config: Dict[str, Any] = Field(default_factory=dict)
-    position: Optional[Dict[str, float]] = None  # {x, y} for frontend canvas
+class Requirement(BaseModel):
+    """A mandatory condition: the step cannot be left until the user confirms it."""
+    id: str
+    text: str
 
     @field_validator("id")
     @classmethod
-    def validate_id(cls, v: str) -> str:
-        if not v or not _SLUG_RE.match(v):
-            raise ValueError("step id must match ^[a-zA-Z0-9_-]+$")
-        return v
+    def _slug_id(cls, v: str) -> str:
+        return _slug(v)
 
 
-class Transition(BaseModel):
-    id: Optional[str] = None
-    from_step: str = Field(..., alias="from", description="Source step id")
-    to: str = Field(..., description="Target step id")
-    condition: Optional[str] = None  # expression, e.g. "variables.approved == true"
-    label: Optional[str] = None
+class JiraTemplate(BaseModel):
+    """Create a Jira issue on this step. `{codeName}` placeholders are filled from properties."""
+    project: str = ""
+    issue_type: str = "Task"
+    summary: str = ""
+    description: str = ""
+    labels: List[str] = Field(default_factory=list)
+    priority: str = ""
+    required_fields: List[str] = Field(default_factory=list)
+    required: bool = True  # step cannot be left before the issue is created
+    extra_fields: Dict[str, Any] = Field(default_factory=dict)
 
-    model_config = {"populate_by_name": True}
-
-
-class LLMConfig(BaseModel):
-    provider: str = Field(default="mistral", description="LLM provider id")
-    model: str = Field(default="mistral-small-latest")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    system_prompt: Optional[str] = None
-    max_tokens: Optional[int] = Field(default=None, ge=1)
-
-
-class TrackSettings(BaseModel):
-    timeout_hours: Optional[int] = Field(default=None, ge=1)
-    max_retries: int = Field(default=0, ge=0)
-    allow_parallel: bool = False
+    def placeholders(self) -> List[str]:
+        keys = re.findall(r"\{([a-zA-Z0-9_-]+)\}", self.summary + " " + self.description)
+        out: List[str] = []
+        for k in list(self.required_fields) + keys:
+            if k not in out:
+                out.append(k)
+        return out
 
 
-class Track(BaseModel):
-    id: str = Field(..., description="Track slug")
+class AgentExtras(BaseModel):
+    """Activity_*/agent.json — what the agent needs beyond the partner format."""
+    agent_instructions: str = ""
+    requirements: List[Requirement] = Field(default_factory=list)
+    jira: Optional[JiraTemplate] = None
+    link_audience: Dict[str, Literal["agent", "user", "both"]] = Field(default_factory=dict)
+    extra_links: List[Link] = Field(default_factory=list)  # documents not linked from content
+
+
+class Activity(BaseModel):
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    properties: List[Dict[str, Any]] = Field(default_factory=list)
+    attachments: List[Any] = Field(default_factory=list)
+    agent: AgentExtras = Field(default_factory=AgentExtras)
+
+    @property
+    def name(self) -> str:
+        return str(self.metadata.get("name") or "")
+
+    @property
+    def content(self) -> str:
+        return str(self.metadata.get("content") or "")
+
+
+def new_activity_metadata(task_id: str, name: str, order: int, task_type: str = "task") -> Dict[str, Any]:
+    """Same keys and defaults as metadata.json exported by the partner system."""
+    return {"id": str(uuid.uuid4()), "name": name, "codeName": task_id, "content": "",
+            "format": "tiptap", "displayOrder": order, "type": task_type, "jiraSendTask": None,
+            "sberTrackSendTask": None, "waitTask": None,
+            "isTaskCompletionNotificationActive": False, "properties": [], "attachments": [],
+            "commentsCount": 0, "timeEstimate": {"quantity": 0, "unit": "minutes"},
+            "isNew": False, "isModified": False, "isDeleted": False, "error": None}
+
+
+def new_property(track_uuid: str, code: str = "", name: str = "") -> Dict[str, Any]:
+    return {"id": str(uuid.uuid4()), "name": name, "codeName": code, "description": "",
+            "isArtifact": False, "isEditableInTaskOnly": True, "requiredToFillOut": True,
+            "valueType": "string", "valueVariants": [], "trackId": track_uuid, "isUnused": False}
+
+
+class TrackMeta(BaseModel):
+    """track.json — our sidecar with platform-only data."""
+    id: str
     name: str = Field(..., min_length=1)
+    description: str = ""
+    status: TrackStatus = TrackStatus.draft
     version: int = Field(default=1, ge=1)
-    status: TrackStatus = Field(default=TrackStatus.draft)
-    team: str = Field(..., min_length=1)
-    description: Optional[str] = None
-    variables: Dict[str, Any] = Field(default_factory=dict)
-    steps: List[Step] = Field(default_factory=list)
-    transitions: List[Transition] = Field(default_factory=list)
-    integrations: Dict[str, Any] = Field(default_factory=dict)
-    settings: TrackSettings = Field(default_factory=TrackSettings)
-    llm_config: Optional[LLMConfig] = None
+    track_uuid: str = Field(default_factory=lambda: str(uuid.uuid4()))  # properties[].trackId
+    agent_instructions: str = ""  # applies to every step
+    model: str = ""  # overrides the global model when set
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
-    @field_validator("id", "team")
+    @field_validator("id")
     @classmethod
-    def validate_slug(cls, v: str) -> str:
-        if not _SLUG_RE.match(v):
-            raise ValueError("must match ^[a-zA-Z0-9_-]+$")
-        return v
+    def _slug_id(cls, v: str) -> str:
+        return _slug(v)
+
+
+class Track(TrackMeta):
+    bpmn: str
+    tasks: List[str] = Field(default_factory=list)  # tasks.json
+    activities: Dict[str, Activity] = Field(default_factory=dict)
+    _graph: Any = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def parse_scheme(self) -> "Track":
+        from backend import bpmn  # local import: bpmn has no model dependencies
+        try:
+            self._graph = bpmn.parse(self.bpmn)
+        except bpmn.BpmnError as e:
+            raise ValueError(str(e)) from e
+        return self
+
+    @property
+    def graph(self):
+        return self._graph
+
+    def activity(self, task_id: Optional[str]) -> Optional[Activity]:
+        return self.activities.get(task_id or "")
+
+    def step_name(self, task_id: Optional[str]) -> str:
+        node = self.graph.nodes.get(task_id or "")
+        act = self.activity(task_id)
+        return " ".join(((node.name if node else "") or (act.name if act else "") or (task_id or "")).split())
+
+    def props(self) -> Dict[str, Dict[str, Any]]:
+        """codeName -> property (with "_activity" = owning task id)."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for tid in self.tasks or list(self.activities):
+            act = self.activities.get(tid)
+            for p in act.properties if act else []:
+                code = p.get("codeName")
+                if code and code not in out:
+                    out[code] = {**p, "_activity": tid}
+        return out
+
+    def meta(self) -> TrackMeta:
+        return TrackMeta(**self.model_dump(include=set(TrackMeta.model_fields)))
 
     def touch(self) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        if not self.created_at:
-            self.created_at = now
+        now = now_iso()
+        self.created_at = self.created_at or now
         self.updated_at = now
 
 
+class TrackIn(BaseModel):
+    """Body of POST/PUT /api/tracks. An empty `bpmn` on create means "start from a template"."""
+    id: str
+    name: str
+    description: str = ""
+    agent_instructions: str = ""
+    model: str = ""
+    bpmn: str = ""
+    tasks: List[str] = Field(default_factory=list)
+    activities: Dict[str, Activity] = Field(default_factory=dict)
+    task_types: Dict[str, str] = Field(default_factory=dict)  # editor: task id -> task|jira-send
+
+
 # ---------------------------------------------------------------------------
-# Run / History
+# Run
 # ---------------------------------------------------------------------------
 
-class HistoryEntry(BaseModel):
+class RunStatus(str, Enum):
+    active = "active"
+    completed = "completed"
+    cancelled = "cancelled"
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant", "event"]
+    text: str
     step_id: Optional[str] = None
-    type: str = Field(default="message", description="message | system | step_enter | step_exit")
-    text: Optional[str] = None
-    payload: Optional[Dict[str, Any]] = None
-    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    user_id: Optional[str] = None
+    at: str = Field(default_factory=now_iso)
+
+
+class StepVisit(BaseModel):
+    step_id: str
+    entered_at: str = Field(default_factory=now_iso)
+    left_at: Optional[str] = None
+
+
+class JiraIssueRef(BaseModel):
+    key: str
+    url: str = ""
+    summary: str = ""
+    step_id: Optional[str] = None
+    status: str = ""
+    created_at: str = Field(default_factory=now_iso)
 
 
 class Run(BaseModel):
-    run_id: str = Field(..., description="Unique run identifier")
+    run_id: str
     user_id: str = Field(..., min_length=1)
-    team: str = Field(..., min_length=1)
-    track_id: str = Field(..., min_length=1)
+    user_name: str = ""
+    track_id: str
     track_version: int = Field(..., ge=1)
+    track_name: str = ""
+    status: RunStatus = RunStatus.active
     current_step: Optional[str] = None
-    status: RunStatus = Field(default=RunStatus.active)
-    variables: Dict[str, Any] = Field(default_factory=dict)
-    history: List[HistoryEntry] = Field(default_factory=list)
-    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-
-    @field_validator("run_id", "team", "track_id")
-    @classmethod
-    def validate_slug(cls, v: str) -> str:
-        # run_id may be uuid-like, allow broader but still safe
-        if not v or len(v) > 128:
-            raise ValueError("invalid identifier length")
-        return v
+    facts: Dict[str, Any] = Field(default_factory=dict)  # everything the user told us
+    confirmed: Dict[str, Dict[str, str]] = Field(default_factory=dict)  # step -> req id -> evidence
+    jira_issues: List[JiraIssueRef] = Field(default_factory=list)
+    visits: List[StepVisit] = Field(default_factory=list)
+    messages: List[ChatMessage] = Field(default_factory=list)
+    summary: str = ""
+    created_at: str = Field(default_factory=now_iso)
+    updated_at: str = Field(default_factory=now_iso)
+    finished_at: Optional[str] = None
 
     def touch(self) -> None:
-        self.updated_at = datetime.now(timezone.utc).isoformat()
+        self.updated_at = now_iso()
 
 
-# ---------------------------------------------------------------------------
-# Request / Response helpers
-# ---------------------------------------------------------------------------
-
-class CreateTrackRequest(BaseModel):
-    id: str
-    name: str
-    team: str
-    description: Optional[str] = None
-    variables: Dict[str, Any] = Field(default_factory=dict)
-    steps: List[Step] = Field(default_factory=list)
-    transitions: List[Transition] = Field(default_factory=list)
-    integrations: Dict[str, Any] = Field(default_factory=dict)
-    settings: Optional[TrackSettings] = None
-    llm_config: Optional[LLMConfig] = None
-    status: Optional[TrackStatus] = None
-
-    @field_validator("id", "team")
-    @classmethod
-    def validate_slug(cls, v: str) -> str:
-        if not _SLUG_RE.match(v):
-            raise ValueError("must match ^[a-zA-Z0-9_-]+$")
-        return v
-
-
-class StartRunRequest(BaseModel):
+class StartRunIn(BaseModel):
     track_id: str
-    team: str
-    user_id: str
-    variables: Optional[Dict[str, Any]] = None
+    user_id: str = Field(..., min_length=1, max_length=128)
+    user_name: str = ""
 
 
-class MessageRequest(BaseModel):
-    text: str = Field(..., min_length=1)
-    user_id: Optional[str] = None
-    payload: Optional[Dict[str, Any]] = None
+class MessageIn(BaseModel):
+    text: str = Field(..., min_length=1, max_length=20000)
 
 
-class AdvanceRequest(BaseModel):
-    target_step: Optional[str] = None
-    variables: Optional[Dict[str, Any]] = None
-    status: Optional[RunStatus] = None
-    text: Optional[str] = None
+# ---------------------------------------------------------------------------
+# Settings (config/settings.json)
+# ---------------------------------------------------------------------------
+
+class AgentSettings(BaseModel):
+    base_url: str = "https://api.mistral.ai/v1"  # any OpenAI-compatible /chat/completions
+    model: str = "mistral-medium-latest"
+    api_key: str = ""
+    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=1500, ge=64)
+    system_prompt: str = ""  # appended to the built-in agent prompt
+    history_limit: int = Field(default=40, ge=4)  # chat messages sent to the model
+    timeout_s: int = Field(default=90, ge=5)
+    extra_body: Dict[str, Any] = Field(default_factory=dict)  # merged into every request
 
 
-class LLMGlobalConfig(BaseModel):
-    provider: str = Field(default="mistral")
-    model: str = Field(default="mistral-small-latest")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    api_key_configured: bool = False
-    base_url: Optional[str] = None
-    max_tokens: Optional[int] = Field(default=None, ge=1)
-    extra: Dict[str, Any] = Field(default_factory=dict)
+class JiraSettings(BaseModel):
+    mode: Literal["mock", "cloud", "server"] = "mock"
+    base_url: str = ""
+    email: str = ""  # cloud: basic auth email
+    token: str = ""  # cloud: API token, server: personal access token
+    default_project: str = ""
+
+
+class LinkSettings(BaseModel):
+    confluence_base_url: str = ""
+    confluence_email: str = ""
+    confluence_token: str = ""
+    timeout_s: int = Field(default=15, ge=2)
+    max_chars: int = Field(default=12000, ge=1000)  # per link, injected into the agent context
+
+
+class RunSettings(BaseModel):
+    stale_hours: int = Field(default=24, ge=1)  # an active run with no activity is "stalled"
+
+
+class Settings(BaseModel):
+    agent: AgentSettings = Field(default_factory=AgentSettings)
+    jira: JiraSettings = Field(default_factory=JiraSettings)
+    links: LinkSettings = Field(default_factory=LinkSettings)
+    runs: RunSettings = Field(default_factory=RunSettings)
+
+
+SECRET_FIELDS = {("agent", "api_key"), ("jira", "token"), ("links", "confluence_token")}

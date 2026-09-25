@@ -1,587 +1,425 @@
-#!/usr/bin/env python3
-"""FastAPI backend for n8n Track Platform.
+"""FastAPI app: user API (catalog, runs, chat), analyst API (tracks, stats, settings), static UI.
 
-Filesystem JSON storage + optional SQLite fallback (not required).
-Port 19001, CORS enabled, serves frontend static files.
+Analyst routes require the X-Analyst-Token header when ANALYST_TOKEN is set in the environment.
 """
 
 from __future__ import annotations
 
 import logging
-import uuid
-from datetime import datetime, timezone
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ValidationError
 
-try:
-    from backend.models import (
-        AdvanceRequest,
-        CreateTrackRequest,
-        HistoryEntry,
-        LLMGlobalConfig,
-        MessageRequest,
-        Run,
-        RunStatus,
-        StartRunRequest,
-        Track,
-        TrackSettings,
-        TrackStatus,
-    )
-    from backend import storage
-except ImportError:
-    from models import (  # type: ignore
-        AdvanceRequest,
-        CreateTrackRequest,
-        HistoryEntry,
-        LLMGlobalConfig,
-        MessageRequest,
-        Run,
-        RunStatus,
-        StartRunRequest,
-        Track,
-        TrackSettings,
-        TrackStatus,
-    )
-    import storage  # type: ignore
-
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
+from backend import agent, bpmn, engine, jira, links, llm, stats, storage, tracks
+from backend.models import (SLUG_RE, MessageIn, Run, RunStatus, Settings, StartRunIn, Track, TrackIn,
+                            TrackStatus)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="n8n Track Platform",
-    version="1.0.0",
-    description="Track orchestration backend - filesystem JSON storage",
-)
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-FRONTEND_DIR = BASE_DIR / "frontend"
-PORT = 19001
+app = FastAPI(title="Track Platform", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _next_step(track: Track, current_step_id: Optional[str], variables: Dict[str, Any]) -> Optional[str]:
-    """Determine next step id based on transitions.
-
-    - If no current step, return first step (if any).
-    - Otherwise follow first matching transition.
-    - Supports simple condition evaluation: if condition string is present,
-      it is treated as truthy only when variables contains matching key.
-      For production, keep it simple and deterministic.
-    """
-    if not track.steps:
-        return None
-    if current_step_id is None:
-        return track.steps[0].id
-
-    # Find transitions from current step
-    outgoing = [t for t in track.transitions if t.from_step == current_step_id]
-    if not outgoing:
-        # Linear fallback: next step in list order
-        ids = [s.id for s in track.steps]
-        try:
-            idx = ids.index(current_step_id)
-            if idx + 1 < len(ids):
-                return ids[idx + 1]
-        except ValueError:
-            pass
-        return None
-
-    # Evaluate conditions naively: if condition is None or empty -> match.
-    # If condition references a variable, check variables dict.
-    for t in outgoing:
-        if not t.condition:
-            return t.to
-        # Very simple evaluator: condition like "approved == true" or "variables.x"
-        # We do substring check against variables truthiness to stay safe without eval.
-        cond = t.condition.strip()
-        # Direct variable truthiness: condition == variable name
-        if cond in variables and variables[cond]:
-            return t.to
-        # Handle "var == value" pattern
-        if "==" in cond:
-            parts = [p.strip().strip("'\"") for p in cond.split("==", 1)]
-            var_name = parts[0].removeprefix("variables.")
-            expected = parts[1].lower()
-            actual = str(variables.get(var_name, "")).lower()
-            if actual == expected:
-                return t.to
-            continue
-        if "!=" in cond:
-            parts = [p.strip().strip("'\"") for p in cond.split("!=", 1)]
-            var_name = parts[0].removeprefix("variables.")
-            expected = parts[1].lower()
-            actual = str(variables.get(var_name, "")).lower()
-            if actual != expected:
-                return t.to
-            continue
-        # Fallback: if condition string appears as key with truthy value
-        key = cond.removeprefix("variables.")
-        if variables.get(key):
-            return t.to
-
-    # No condition matched - follow first unconditional or return None
-    return None
+def analyst_auth(x_analyst_token: Optional[str] = Header(default=None),
+                 token_q: Optional[str] = Query(default=None, alias="token")) -> None:
+    """Header for fetch() calls; ?token= for plain download links (export)."""
+    token = os.environ.get("ANALYST_TOKEN")
+    if token and token not in (x_analyst_token, token_q):
+        raise HTTPException(401, "нужен токен аналитика")
 
 
-def _get_step(track: Track, step_id: str):
-    for s in track.steps:
-        if s.id == step_id:
-            return s
-    return None
+user_api = APIRouter(prefix="/api")
+analyst_api = APIRouter(prefix="/api", dependencies=[Depends(analyst_auth)])
 
 
-# ---------------------------------------------------------------------------
-# Health
-# ---------------------------------------------------------------------------
-
-@app.get("/api/health")
-def health():
-    return {"status": "ok", "version": "1.0.0"}
-
-
-# ---------------------------------------------------------------------------
-# Tracks
-# ---------------------------------------------------------------------------
-
-@app.post("/api/tracks", response_model=Track, status_code=201)
-def create_or_update_track(body: CreateTrackRequest):
-    """Create or update a track. Auto-increments version on content change."""
+def _load_track(track_id: str, version: Optional[int] = None) -> Track:
     try:
-        # Try to load existing
-        try:
-            existing = storage.load_track(body.team, body.id)
-            # Merge incoming fields onto existing track
-            track = Track(
-                id=body.id,
-                name=body.name,
-                team=body.team,
-                description=body.description if body.description is not None else existing.description,
-                variables=body.variables if body.variables else existing.variables,
-                steps=body.steps if body.steps else existing.steps,
-                transitions=body.transitions if body.transitions else existing.transitions,
-                integrations=body.integrations if body.integrations else existing.integrations,
-                settings=body.settings or existing.settings,
-                llm_config=body.llm_config or existing.llm_config,
-                status=body.status or existing.status,
-                version=existing.version,
-                created_at=existing.created_at,
-                updated_at=existing.updated_at,
-            )
-            # If steps/transitions explicitly provided (even empty list means keep? handled above)
-            # When body.steps is provided as empty list we keep existing per above logic.
-            # To allow clearing, client should send non-empty or we treat explicit.
-            # Use raw body dict to detect explicit keys
-            raw = body.model_dump()
-            # For steps/transitions, if caller sent them we should respect even if empty
-            # Pydantic always sets default [], so we check by re-parsing request? Simpler: keep above.
-            # Actually allow overwrite if caller explicitly wants to replace: use body.steps directly
-            # We already handle: if body.steps is truthy use it else keep existing - preserves.
-            # For variables/integrations similarly.
-            result = storage.save_track(track)
-            return result
-        except FileNotFoundError:
-            # Create new
-            track = Track(
-                id=body.id,
-                name=body.name,
-                team=body.team,
-                description=body.description,
-                variables=body.variables or {},
-                steps=body.steps or [],
-                transitions=body.transitions or [],
-                integrations=body.integrations or {},
-                settings=body.settings or TrackSettings(),
-                llm_config=body.llm_config,
-                status=body.status or TrackStatus.draft,
-                version=1,
-            )
-            result = storage.save_track(track)
-            return result
+        return storage.load_track(track_id, version)
+    except FileNotFoundError:
+        raise HTTPException(404, "трек не найден")
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception("create_or_update_track failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(400, str(e))
 
 
-@app.get("/api/tracks", response_model=List[Track])
-def list_tracks(team: Optional[str] = Query(default=None)):
+def _load_run(run_id: str) -> Run:
     try:
-        return storage.list_tracks(team=team)
-    except Exception as e:
-        logger.exception("list_tracks failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/tracks/{team}/{track_id}", response_model=Track)
-def get_track(team: str, track_id: str, version: Optional[int] = Query(default=None)):
-    try:
-        return storage.load_track(team, track_id, version=version)
+        return storage.load_run(run_id)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Track not found")
+        raise HTTPException(404, "прохождение не найдено")
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, str(e))
 
 
-@app.get("/api/tracks/{team}/{track_id}/versions")
-def get_versions(team: str, track_id: str):
-    try:
-        versions = storage.list_versions(team, track_id)
-        # Also include current version info
-        track = storage.load_track(team, track_id)
-        return {"team": team, "track_id": track_id, "current_version": track.version, "versions": versions}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Track not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.post("/api/tracks/{team}/{track_id}/publish", response_model=Track)
-def publish_track(team: str, track_id: str):
-    try:
-        track = storage.load_track(team, track_id)
-        track.status = TrackStatus.published
-        result = storage.save_track(track)
-        return result
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Track not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.delete("/api/tracks/{team}/{track_id}")
-def delete_track(team: str, track_id: str):
-    try:
-        storage.delete_track(team, track_id)
-        return {"status": "deleted", "team": team, "track_id": track_id}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Track not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# ---------------------------------------------------------------------------
-# Runs
-# ---------------------------------------------------------------------------
-
-@app.post("/api/runs/start", response_model=Run, status_code=201)
-def start_run(body: StartRunRequest):
-    try:
-        track = storage.load_track(body.team, body.track_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Track not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    run_id = str(uuid.uuid4())
-    # Merge track variables with run variables
-    variables: Dict[str, Any] = {}
-    variables.update(track.variables or {})
-    if body.variables:
-        variables.update(body.variables)
-
-    # Determine initial step
-    initial_step: Optional[str] = None
-    if track.steps:
-        initial_step = track.steps[0].id
-
-    run = Run(
-        run_id=run_id,
-        user_id=body.user_id,
-        team=body.team,
-        track_id=body.track_id,
-        track_version=track.version,
-        current_step=initial_step,
-        status=RunStatus.active if initial_step else RunStatus.completed,
-        variables=variables,
-        history=[],
-        created_at=datetime.now(timezone.utc).isoformat(),
-        updated_at=datetime.now(timezone.utc).isoformat(),
-    )
-
-    # Add system history entry
-    run.history.append(HistoryEntry(
-        step_id=initial_step,
-        type="system",
-        text=f"Run started for track {body.track_id} v{track.version}",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    ))
-
-    # If initial step is a message-type, add it to history
-    if initial_step:
-        step = _get_step(track, initial_step)
-        if step and step.type.value == "message" and step.config.get("text"):
-            run.history.append(HistoryEntry(
-                step_id=initial_step,
-                type="step_enter",
-                text=step.config["text"],
-                payload=step.config,
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            ))
-
-    storage.save_run(run)
-    logger.info("Started run %s for %s/%s", run_id, body.team, body.track_id)
-    return run
-
-
-@app.get("/api/runs/{run_id}", response_model=Run)
-def get_run(run_id: str, team: Optional[str] = Query(default=None)):
-    try:
-        if team:
-            return storage.load_run(team, run_id)
-        return storage.load_run_any(run_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Run not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.get("/api/runs", response_model=List[Run])
-def list_runs(team: Optional[str] = Query(default=None), user_id: Optional[str] = Query(default=None)):
-    try:
-        return storage.list_runs(team=team, user_id=user_id)
-    except Exception as e:
-        logger.exception("list_runs failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/runs/{run_id}/message", response_model=Run)
-def post_message(run_id: str, body: MessageRequest):
-    try:
-        run = storage.load_run_any(run_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    if run.status in (RunStatus.completed, RunStatus.failed, RunStatus.cancelled):
-        raise HTTPException(status_code=400, detail=f"Run is already {run.status.value}")
-
-    # Append user message to history
-    run.history.append(HistoryEntry(
-        step_id=run.current_step,
-        type="message",
-        text=body.text,
-        payload=body.payload,
-        user_id=body.user_id or run.user_id,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    ))
-
-    # Store variable if needed
-    run.variables["_last_message"] = body.text
-    if body.payload:
-        run.variables.update(body.payload)
-
-    # Try to advance workflow
-    try:
-        track = storage.load_track(run.team, run.track_id, version=run.track_version)
-    except FileNotFoundError:
-        # Fallback to latest
-        try:
-            track = storage.load_track(run.team, run.track_id)
-        except FileNotFoundError:
-            storage.save_run(run)
-            return run
-
-    # Determine next step
-    next_step = _next_step(track, run.current_step, run.variables)
-
-    if next_step:
-        # Record step exit
-        run.history.append(HistoryEntry(
-            step_id=run.current_step,
-            type="step_exit",
-            text=f"Transition to {next_step}",
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        ))
-        run.current_step = next_step
-        step = _get_step(track, next_step)
-        if step:
-            # Auto-handle wait / message steps
-            if step.type.value in ("message", "wait") and step.config.get("text"):
-                run.history.append(HistoryEntry(
-                    step_id=next_step,
-                    type="step_enter",
-                    text=step.config["text"],
-                    payload=step.config,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                ))
-            elif step.type.value == "wait":
-                run.status = RunStatus.waiting
-            else:
-                run.history.append(HistoryEntry(
-                    step_id=next_step,
-                    type="step_enter",
-                    text=f"Entered step {step.name or step.id} ({step.type.value})",
-                    payload=step.config,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                ))
-            # If this is the last step and no outgoing transitions, mark waiting or completed
-            has_outgoing = any(t.from_step == next_step for t in track.transitions)
-            if not has_outgoing:
-                # Check if step type suggests completion
-                if step.type.value in ("message", "action"):
-                    # Stay active, let next message complete or explicit advance
-                    pass
-    else:
-        # No next step -> complete
-        run.current_step = None
-        run.status = RunStatus.completed
-        run.history.append(HistoryEntry(
-            type="system",
-            text="Run completed",
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        ))
-
-    storage.save_run(run)
-    return run
-
-
-@app.post("/api/runs/{run_id}/advance", response_model=Run)
-def advance_run(run_id: str, body: AdvanceRequest):
-    """Webhook endpoint for n8n to advance a run.
-
-    n8n workflows call this to move the run to a specific step or complete it.
-    """
-    try:
-        run = storage.load_run_any(run_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    if run.status in (RunStatus.completed, RunStatus.failed, RunStatus.cancelled):
-        raise HTTPException(status_code=400, detail=f"Run is already {run.status.value}")
-
-    if body.variables:
-        run.variables.update(body.variables)
-
-    if body.target_step is not None:
-        # Explicit step jump
-        run.current_step = body.target_step if body.target_step else None
-        run.history.append(HistoryEntry(
-            step_id=body.target_step,
-            type="system",
-            text=body.text or f"Advanced to step {body.target_step}" if body.target_step else "Advanced (completed)",
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        ))
-        if not body.target_step:
-            run.status = RunStatus.completed
-    else:
-        # Auto-advance via transitions
-        try:
-            track = storage.load_track(run.team, run.track_id, version=run.track_version)
-        except FileNotFoundError:
+def _rows(runs: List[Run]) -> List[Dict[str, Any]]:
+    """Table rows, each computed against the track version the run is pinned to."""
+    stale = storage.load_settings().runs.stale_hours
+    cache: Dict[tuple, Optional[Track]] = {}
+    out = []
+    for r in runs:
+        key = (r.track_id, r.track_version)
+        if key not in cache:
             try:
-                track = storage.load_track(run.team, run.track_id)
+                cache[key] = engine.track_for_run(r)
             except FileNotFoundError:
-                raise HTTPException(status_code=404, detail="Track not found for run")
-        nxt = _next_step(track, run.current_step, run.variables)
-        if nxt:
-            run.current_step = nxt
-            run.history.append(HistoryEntry(
-                step_id=nxt,
-                type="system",
-                text=body.text or f"Advanced to {nxt}",
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            ))
-        else:
-            run.current_step = None
-            run.status = RunStatus.completed
-            run.history.append(HistoryEntry(
-                type="system",
-                text=body.text or "Run completed via advance",
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            ))
+                cache[key] = None
+        out.append(stats.run_row(r, cache[key], stale))
+    return out
 
-    if body.status:
-        run.status = body.status
-        if body.status == RunStatus.completed:
-            run.current_step = None
 
-    storage.save_run(run)
-    logger.info("Advanced run %s -> step=%s status=%s", run_id, run.current_step, run.status)
-    return run
+def _run_view(run: Run) -> Dict[str, Any]:
+    track = engine.track_for_run(run)
+    return {"run": run.model_dump(mode="json"), "progress": engine.progress(run, track)}
+
+
+@user_api.get("/health")
+def health():
+    return {"status": "ok", "version": app.version}
 
 
 # ---------------------------------------------------------------------------
-# Teams / Config
+# User: catalog and runs
 # ---------------------------------------------------------------------------
 
-@app.get("/api/teams")
-def get_teams():
-    teams = storage.load_teams()
-    # Also discover teams from track directories
+@user_api.get("/catalog")
+def catalog():
+    return [{"id": t.id, "name": t.name, "description": t.description,
+             "steps": len(t.graph.tasks), "version": t.version}
+            for t in storage.list_tracks(TrackStatus.published)]
+
+
+@user_api.post("/runs", status_code=201)
+def start_run(body: StartRunIn):
+    track = _load_track(body.track_id)
     try:
-        for entry in storage.TRACKS_DIR.iterdir():
-            if entry.is_dir():
-                name = entry.name
-                if not any(t.get("id") == name or t == name for t in teams):
-                    teams.append({"id": name, "name": name})
-    except FileNotFoundError:
-        pass
-    return {"teams": teams}
+        run = engine.start_run(track, body.user_id, body.user_name)
+    except engine.RuleError as e:
+        raise HTTPException(400, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    with storage.run_lock(run.run_id):
+        agent.run_turn(run, None, storage.load_settings())
+        storage.save_run(run)
+    return _run_view(run)
 
 
-@app.get("/api/config/llm")
-def get_llm_config():
-    return storage.load_llm_config()
+@user_api.get("/runs")
+def list_user_runs(user_id: str = Query(..., min_length=1)):
+    return _rows(storage.list_runs(user_id=user_id))
 
 
-@app.put("/api/config/llm")
-def put_llm_config(body: Dict[str, Any]):
-    # Validate via model but allow extra fields
+@user_api.get("/runs/{run_id}")
+def get_run(run_id: str):
+    return _run_view(_load_run(run_id))
+
+
+@user_api.post("/runs/{run_id}/messages")
+def post_message(run_id: str, body: MessageIn):
+    lock = storage.run_lock(run_id)
+    if not lock.acquire(timeout=1):
+        raise HTTPException(409, "агент ещё отвечает на предыдущее сообщение")
     try:
-        cfg = LLMGlobalConfig.model_validate(body)
-        data = cfg.model_dump(mode="json")
-        # Preserve extra keys not in model
-        for k, v in body.items():
-            if k not in data:
-                data["extra"][k] = v
-        storage.save_llm_config(data)
-        return data
-    except Exception as e:
-        # Fallback: store raw if validation fails partially
-        logger.warning("LLM config validation warning: %s", e)
-        # Try minimal validation, else save raw
+        run = _load_run(run_id)
         try:
-            LLMGlobalConfig.model_validate(body)
-        except Exception as ve:
-            raise HTTPException(status_code=400, detail=str(ve))
-        storage.save_llm_config(body)
-        return body
+            agent.run_turn(run, body.text.strip(), storage.load_settings())
+        except engine.RuleError as e:
+            raise HTTPException(400, str(e))
+        storage.save_run(run)
+        return _run_view(run)
+    finally:
+        lock.release()
+
+
+@user_api.post("/runs/{run_id}/resume")
+def resume_run(run_id: str):
+    """Ask the agent to recap where the user stopped (used when coming back to a run)."""
+    with storage.run_lock(run_id):
+        run = _load_run(run_id)
+        if run.status == RunStatus.active:
+            agent.run_turn(run, None, storage.load_settings())
+            storage.save_run(run)
+        return _run_view(run)
+
+
+@user_api.post("/runs/{run_id}/cancel")
+def cancel_run(run_id: str):
+    with storage.run_lock(run_id):
+        run = _load_run(run_id)
+        try:
+            engine.cancel(run)
+        except engine.RuleError as e:
+            raise HTTPException(400, str(e))
+        storage.save_run(run)
+        return _run_view(run)
 
 
 # ---------------------------------------------------------------------------
-# Static frontend
+# Analyst: tracks
 # ---------------------------------------------------------------------------
+
+@analyst_api.get("/tracks")
+def list_tracks():
+    runs = storage.list_runs()
+    out = []
+    for t in storage.list_tracks():
+        mine = [r for r in runs if r.track_id == t.id]
+        out.append({"id": t.id, "name": t.name, "description": t.description,
+                    "status": t.status.value, "version": t.version, "steps": len(t.graph.tasks),
+                    "updated_at": t.updated_at, "runs": len(mine),
+                    "active": sum(1 for r in mine if r.status == RunStatus.active)})
+    return out
+
+
+def _track_view(t: Track, lint: Optional[Dict[str, List[str]]] = None) -> Dict[str, Any]:
+    return {"track": t.model_dump(mode="json"), "lint": lint or tracks.lint(t),
+            "versions": storage.list_versions(t.id) if _exists(t.id) else []}
+
+
+def _exists(track_id: str) -> bool:
+    try:
+        storage.load_track(track_id)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+@analyst_api.get("/tracks/{track_id}")
+def get_track(track_id: str, version: Optional[int] = None):
+    return _track_view(_load_track(track_id, version))
+
+
+def _build(body: TrackIn, existing: Optional[Track]) -> Track:
+    """Editor payload -> consistent track (scheme is the source of truth for the steps)."""
+    try:
+        meta = existing.meta().model_dump() if existing else {}
+        meta.update(id=body.id, name=body.name, description=body.description,
+                    agent_instructions=body.agent_instructions, model=body.model)
+        if not body.bpmn.strip():
+            if existing:
+                raise HTTPException(400, "пустая схема")
+            base = tracks.new_track(body.id, body.name, body.description)
+            return base.model_copy(update={k: v for k, v in meta.items() if k != "track_uuid"})
+        t = Track.model_validate({**meta, "bpmn": body.bpmn,
+                                  "tasks": body.tasks or (existing.tasks if existing else []),
+                                  "activities": body.activities})
+        return tracks.sync(t, body.task_types)
+    except ValidationError as e:
+        raise HTTPException(422, "; ".join(str(err["msg"]) for err in e.errors()))
+    except bpmn.BpmnError as e:
+        raise HTTPException(422, str(e))
+
+
+def _save(track: Track, status: TrackStatus) -> Dict[str, Any]:
+    track = track.model_copy(update={"status": status})
+    lint = tracks.lint(track)
+    if status == TrackStatus.published and lint["errors"]:
+        raise HTTPException(400, "опубликованный трек должен быть без ошибок: " + "; ".join(lint["errors"]))
+    return _track_view(storage.save_track(track), lint)
+
+
+@analyst_api.post("/tracks", status_code=201)
+def create_track(body: TrackIn):
+    if not SLUG_RE.match(body.id or ""):
+        raise HTTPException(400, "идентификатор: латиница, цифры, - и _")
+    if _exists(body.id):
+        raise HTTPException(409, f"трек с id «{body.id}» уже есть")
+    return _save(_build(body, None), TrackStatus.draft)
+
+
+@analyst_api.put("/tracks/{track_id}")
+def update_track(track_id: str, body: TrackIn):
+    if body.id != track_id:
+        raise HTTPException(400, "id трека менять нельзя, создайте копию")
+    existing = _load_track(track_id)
+    return _save(_build(body, existing), existing.status)
+
+
+def _set_status(track_id: str, status: TrackStatus) -> Dict[str, Any]:
+    return _save(_load_track(track_id), status)
+
+
+@analyst_api.post("/tracks/{track_id}/publish")
+def publish_track(track_id: str):
+    return _set_status(track_id, TrackStatus.published)
+
+
+@analyst_api.post("/tracks/{track_id}/unpublish")
+def unpublish_track(track_id: str):
+    return _set_status(track_id, TrackStatus.draft)
+
+
+@analyst_api.post("/tracks/{track_id}/archive")
+def archive_track(track_id: str):
+    return _set_status(track_id, TrackStatus.archived)
+
+
+@analyst_api.delete("/tracks/{track_id}")
+def delete_track(track_id: str):
+    t = _load_track(track_id)
+    if t.status == TrackStatus.published:
+        raise HTTPException(400, "опубликованный трек нельзя удалить: сначала снимите с публикации "
+                                 "или отправьте в архив")
+    if any(r.status == RunStatus.active for r in storage.list_runs(track_id=track_id)):
+        raise HTTPException(400, "по треку есть незавершённые прохождения, отправьте его в архив")
+    storage.delete_track(track_id)
+    return {"deleted": track_id}
+
+
+@analyst_api.post("/tracks/lint")
+def lint_track(body: TrackIn):
+    try:
+        existing = storage.load_track(body.id) if body.id and SLUG_RE.match(body.id) else None
+    except FileNotFoundError:
+        existing = None
+    try:
+        return tracks.lint(_build(body, existing))
+    except HTTPException as e:
+        return {"errors": [str(e.detail)], "warnings": []}
+
+
+class DraftIn(BaseModel):
+    description: str
+
+
+@analyst_api.post("/tracks/draft")
+def draft_track(body: DraftIn):
+    """A generated track to open in the editor; it is saved only when the analyst saves it."""
+    try:
+        t = agent.draft_track(body.description, storage.load_settings())
+    except llm.LLMError as e:
+        raise HTTPException(502, str(e))
+    except (ValueError, ValidationError, KeyError, TypeError) as e:
+        raise HTTPException(422, f"модель вернула некорректный трек: {e}")
+    return {"track": t.model_dump(mode="json"), "lint": tracks.lint(t), "versions": []}
+
+
+@analyst_api.post("/tracks/import", status_code=201)
+async def import_track(request: Request, id: Optional[str] = None, name: Optional[str] = None,
+                       replace: bool = False):
+    """Body: a zip with scheme.bpmn, tasks.json and Activity_*/ (the partner system's export)."""
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "пустой файл")
+    if len(data) > 50_000_000:
+        raise HTTPException(413, "архив больше 50 МБ")
+    try:
+        t = tracks.sync(tracks.import_zip(data, id, name))
+    except (ValueError, ValidationError, bpmn.BpmnError) as e:
+        raise HTTPException(422, str(e))
+    if not SLUG_RE.match(t.id):
+        raise HTTPException(400, f"некорректный id трека «{t.id}»")
+    if _exists(t.id):
+        if not replace:
+            raise HTTPException(409, f"трек «{t.id}» уже есть — импортируйте с заменой или под другим id")
+        old = storage.load_track(t.id)
+        t = t.model_copy(update={"status": old.status, "track_uuid": old.track_uuid,
+                                 "created_at": old.created_at})
+        return _save(t, old.status)
+    return _save(t, TrackStatus.draft)
+
+
+@analyst_api.get("/tracks/{track_id}/export")
+def export_track(track_id: str, version: Optional[int] = None, pure: bool = False):
+    t = _load_track(track_id, version)
+    data = tracks.export_zip(t, pure=pure)
+    fname = f"{t.id}-v{t.version}{'-partner' if pure else ''}.zip"
+    return Response(data, media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+# ---------------------------------------------------------------------------
+# Analyst: runs and stats
+# ---------------------------------------------------------------------------
+
+@analyst_api.get("/stats/overview")
+def stats_overview():
+    return stats.overview(storage.list_tracks(), storage.list_runs(),
+                          storage.load_settings().runs.stale_hours)
+
+
+@analyst_api.get("/stats/tracks/{track_id}")
+def stats_track(track_id: str):
+    return stats.track_stats(_load_track(track_id), storage.list_runs(track_id=track_id))
+
+
+@analyst_api.get("/admin/runs")
+def admin_runs(track_id: Optional[str] = None, status: Optional[str] = None):
+    rows = _rows(storage.list_runs(track_id=track_id))
+    return [r for r in rows if not status or r["status"] == status]
+
+
+@analyst_api.get("/admin/runs/{run_id}")
+def admin_run(run_id: str):
+    run = _load_run(run_id)
+    view = _run_view(run)
+    view["row"] = stats.run_row(run, engine.track_for_run(run),
+                                storage.load_settings().runs.stale_hours)
+    return view
+
+
+# ---------------------------------------------------------------------------
+# Analyst: settings
+# ---------------------------------------------------------------------------
+
+@analyst_api.get("/settings")
+def get_settings():
+    return storage.public_settings(storage.load_settings())
+
+
+@analyst_api.put("/settings")
+def put_settings(body: Settings):
+    return storage.public_settings(storage.save_settings(body))
+
+
+@analyst_api.post("/settings/test-agent")
+def test_agent():
+    try:
+        msg = llm.chat(storage.load_settings().agent,
+                       [{"role": "user", "content": "Ответь одним словом: готов?"}])
+        return {"ok": True, "message": (msg.get("content") or "").strip()[:200]}
+    except llm.LLMError as e:
+        return {"ok": False, "message": str(e)}
+
+
+@analyst_api.post("/settings/test-jira")
+def test_jira():
+    try:
+        return {"ok": True, "message": jira.check_connection(storage.load_settings().jira)}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+
+class LinkIn(BaseModel):
+    url: str
+
+
+@analyst_api.post("/links/preview")
+def preview_link(body: LinkIn):
+    """Show the analyst exactly what the agent will read from a link."""
+    if not body.url.startswith(("http://", "https://")):
+        raise HTTPException(400, "нужна ссылка http(s)")
+    try:
+        text = links.fetch_text(body.url, storage.load_settings().links)
+        return {"ok": True, "chars": len(text), "text": text[:4000]}
+    except Exception as e:
+        return {"ok": False, "chars": 0, "text": str(e)}
+
+
+app.include_router(user_api)
+app.include_router(analyst_api)
 
 if FRONTEND_DIR.exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
-else:
-    logger.warning("Frontend directory not found: %s", FRONTEND_DIR)
-
-    @app.get("/")
-    def frontend_missing():
-        return JSONResponse({"message": "n8n Track Platform API", "docs": "/docs", "frontend": "not deployed"})
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+    uvicorn.run(app, host="0.0.0.0", port=19001)

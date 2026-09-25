@@ -1,437 +1,553 @@
-"""Tests for n8n Track Platform — 30+ tests covering schemas, transitions, versioning etc.
+"""Tests: python3 -m unittest discover -s tests -t . -v   (from the repo root, no network needed)."""
 
-Run: python3 -m unittest tests.test_tracks -v
-Requires no external deps; uses stdlib + backend/models + backend/storage if available.
-Falls back to local validation when backend modules not installed.
-"""
-import glob
+import io
 import json
-import re
-import sys
+import shutil
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest import mock
 
-BASE = Path(__file__).resolve().parent.parent
-TRACKS_DIR = BASE / "tracks"
-CONFIG_DIR = BASE / "config"
+from fastapi.testclient import TestClient
 
-# Try to import backend models
-sys.path.insert(0, str(BASE / "backend"))
-try:
-    from models import Track, Step, Transition, StepType, TrackStatus, Run, RunStatus, LLMConfig, LLMGlobalConfig
-    HAS_MODELS = True
-except Exception as e:
-    HAS_MODELS = False
-    print(f"[warn] backend.models not available: {e}")
+from backend import agent, bpmn, engine, main, storage, tracks
+from backend.models import JiraIssueRef, Link, RunStatus, Settings, Track
 
-SLUG_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
-VALID_STEP_TYPES = {"message","input","question","jira","validation","action","condition","approval","llm","webhook","wait"}
-VALID_STATUSES = {"draft","published","archived"}
-VALID_RUN_STATUSES = {"active","waiting","completed","failed","cancelled"}
+REPO = Path(__file__).resolve().parent.parent
+# the partner system's example: scheme (3 copy-paste breaks repaired), tasks.json, one activity
+# local only (.gitignore): contains internal links and names, so these tests skip in a clean clone
+PARTNER = REPO / "tests" / "fixtures" / "partner"
+PARTNER_ACTIVITY = "Activity_1huk1tj"
+needs_partner = unittest.skipUnless((PARTNER / "scheme.bpmn").exists(),
+                                    "partner example is local only (tests/fixtures/partner)")
 
-def load_all_tracks():
-    tracks=[]
-    for p in glob.glob(str(TRACKS_DIR / "*" / "*" / "track.json")):
-        with open(p, encoding="utf-8") as f:
-            tracks.append((p, json.load(f)))
-    return tracks
 
-def has_cycle_without_condition(steps, transitions):
-    """Detect cycle where every edge in cycle has no condition -> unconditional loop."""
-    ids = {s["id"] for s in steps}
-    # Build adjacency for unconditional edges only
-    adj = {i: [] for i in ids}
-    for t in transitions:
-        if not t.get("condition"):
-            adj[t["from"]].append(t["to"])
-    # DFS for cycle in unconditional graph
-    visited=set(); stack=set()
-    def dfs(u):
-        visited.add(u); stack.add(u)
-        for v in adj.get(u,[]):
-            if v not in visited:
-                if dfs(v): return True
-            elif v in stack:
-                return True
-        stack.remove(u)
-        return False
-    for node in ids:
-        if node not in visited:
-            if dfs(node): return True
-    return False
+def demo_spec(status="published"):
+    """a -> b -> gateway(env) -> c (prod) | end (test); c is jira-send -> d(install_ok) -> end."""
+    return ({"id": "t1", "name": "Тест", "status": status},
+            [{"id": "a", "name": "Данные",
+              "content": '<p>Смотри <a href="https://wiki.example/doc">инструкцию</a> и '
+                         '<a class="confluence-userlink" href="https://wiki.example/display/~42">Иванова</a></p>',
+              "properties": [{"codeName": "env", "name": "Окружение", "valueType": "select",
+                              "valueVariants": ["test", "prod"]},
+                             {"codeName": "note", "name": "Заметка", "required": False}]},
+             {"id": "b", "name": "Проверки", "requirements": [{"id": "ok", "text": "Тесты зелёные"}],
+              "next": [{"to": "c", "prop": "env", "value": "prod", "name": "Прод"},
+                       {"to": "end", "prop": "env", "value": "test", "name": "Тест"}]},
+             {"id": "c", "name": "Заявка", "type": "jira-send",
+              "jira": {"project": "REL", "summary": "Релиз на {env} {window}"}},
+             {"id": "d", "name": "Установка",
+              "properties": [{"codeName": "install_ok", "name": "Успешно", "valueType": "boolean"}]}])
 
-def resolve_llm_config(global_cfg, team_cfg, track_cfg, step_cfg):
-    """Inheritance Global -> Team -> Track -> Step (step takes precedence)."""
-    result={}
-    for src in [global_cfg, team_cfg, track_cfg, step_cfg]:
-        if not src: continue
-        for k,v in src.items():
-            if v is not None:
-                result[k]=v
-    return result
+
+def make_track(status="published") -> Track:
+    return tracks.from_spec(*demo_spec(status))
+
+
+def ids(track: Track):
+    return {track.activities[t].name: t for t in track.tasks}
+
+
+class TempStorage(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old = storage.root()
+        storage.set_root(self.tmp)
+
+    def tearDown(self):
+        storage.set_root(self._old)
+        shutil.rmtree(self.tmp)
+
 
 # ---------------------------------------------------------------------------
-# 1. Schema validation
+# BPMN
 # ---------------------------------------------------------------------------
-class TestTrackSchema(unittest.TestCase):
-    def test_tracks_exist(self):
-        tracks=load_all_tracks()
-        self.assertGreaterEqual(len(tracks), 1, "No tracks found")
 
-    def test_track_required_fields(self):
-        for path, data in load_all_tracks():
-            for field in ["id","name","team","version","status"]:
-                self.assertIn(field, data, f"{path} missing {field}")
+class TestBpmn(unittest.TestCase):
+    @needs_partner
+    def test_partner_scheme(self):
+        g = bpmn.parse((PARTNER / "scheme.bpmn").read_text(encoding="utf-8"))
+        self.assertEqual(len(g.tasks), 46)
+        self.assertEqual({gr.name for gr in g.groups}, {"Архитектура", "Заявки", "Выпуск", "Разработка"})
+        self.assertTrue(all(gr.members for gr in g.groups))
+        self.assertEqual(sum(1 for f in g.flows.values() if f.condition), 24)
+        self.assertFalse([f for f in g.flows.values() if f.condition_error])
+        jira_send = [n for n in g.tasks if n.task_type == "jira-send"]
+        self.assertEqual(len(jira_send), 12)
 
-    def test_track_id_slug(self):
-        for path, data in load_all_tracks():
-            self.assertRegex(data["id"], SLUG_RE, f"{path} id invalid")
-            self.assertRegex(data["team"], SLUG_RE, f"{path} team invalid")
+    @needs_partner
+    def test_partner_traversal_needs_then_branches(self):
+        g = bpmn.parse((PARTNER / "scheme.bpmn").read_text(encoding="utf-8"))
+        first = bpmn.first_task(g, {})
+        self.assertEqual(first.kind, "task")
+        second = bpmn.follow(g, first.task, {}).task
+        self.assertEqual(bpmn.follow(g, second, {}).need, ["_os__new_team"])
+        yes = bpmn.follow(g, second, {"_os__new_team": True})
+        no = bpmn.follow(g, second, {"_os__new_team": False})
+        self.assertEqual(g.nodes[yes.task].name, "OpenShift")
+        self.assertEqual(g.nodes[no.task].name, "Онбординг")
 
-    def test_track_status_valid(self):
-        for path, data in load_all_tracks():
-            self.assertIn(data["status"], VALID_STATUSES, f"{path} status")
+    @needs_partner
+    def test_leading_blank_line_and_damage(self):
+        xml = (PARTNER / "scheme.bpmn").read_text(encoding="utf-8")
+        self.assertEqual(len(bpmn.parse("\n\n" + xml).tasks), 46)
+        broken = xml.replace('</bpmn:process>', '<bpmn:task id="x"\n\n</bpmn:process>', 1)
+        with self.assertRaises(bpmn.BpmnError) as cm:
+            bpmn.parse(broken)
+        self.assertIn("строка", str(cm.exception))
 
-    def test_track_version_positive(self):
-        for path, data in load_all_tracks():
-            self.assertIsInstance(data["version"], int)
-            self.assertGreaterEqual(data["version"], 1)
+    def test_conditions(self):
+        c = bpmn.parse_condition('${objProps.prop("ai").value() == true}')
+        self.assertEqual((c.prop, c.value), ("ai", True))
+        self.assertTrue(c.matches("да"))
+        self.assertFalse(c.matches(False))
+        c = bpmn.parse_condition('${objProps.prop("_os__prod").value() == "dev"}')
+        self.assertTrue(c.matches("DEV"))
+        self.assertEqual(bpmn.format_condition("_os__prod", "dev"),
+                         '${objProps.prop("_os__prod").value() == "dev"}')
+        self.assertEqual(bpmn.parse_condition(bpmn.format_condition("n", 3)).value, 3)
+        with self.assertRaises(bpmn.BpmnError):
+            bpmn.parse_condition("${x > 1}")
 
-    def test_steps_have_id_and_type(self):
-        for path, data in load_all_tracks():
-            for s in data.get("steps",[]):
-                self.assertIn("id", s, f"{path} step missing id")
-                self.assertIn("type", s, f"{path} step {s.get('id')} missing type")
-                self.assertRegex(s["id"], SLUG_RE, f"{path} step id bad")
+    @needs_partner
+    def test_normalize_plain_task_and_keep_conforming(self):
+        xml = (PARTNER / "scheme.bpmn").read_text(encoding="utf-8")
+        self.assertIs(bpmn.normalize(xml, {}), xml)  # partner file untouched
+        plain = xml.replace('<bpmn:startEvent id="StartEvent_1">',
+                            '<bpmn:task id="Activity_new" name="Новый" />\n<bpmn:startEvent id="StartEvent_1">')
+        g = bpmn.parse(bpmn.normalize(plain, {"Activity_new": "jira-send"}))
+        self.assertEqual(g.nodes["Activity_new"].task_type, "jira-send")
+        self.assertIn('camunda:topic="xray"', bpmn.normalize(plain, {}))
 
-    def test_step_ids_unique_per_track(self):
-        for path, data in load_all_tracks():
-            ids=[s["id"] for s in data.get("steps",[])]
-            self.assertEqual(len(ids), len(set(ids)), f"{path} duplicate step ids")
+    def test_build_roundtrip(self):
+        t = make_track()
+        g = t.graph
+        self.assertEqual(len(g.tasks), 4)
+        self.assertTrue(all(n.task_type in ("task", "jira-send") for n in g.tasks))
+        self.assertTrue(all(i in g.bounds for i in g.nodes))
+        self.assertTrue(all(t.startswith("Activity_") for t in t.tasks))
 
-    def test_pydantic_track_validation(self):
-        if not HAS_MODELS:
-            self.skipTest("models not available")
-        for path, data in load_all_tracks():
-            try:
-                Track.model_validate(data)
-            except Exception as e:
-                self.fail(f"{path} pydantic validation failed: {e}")
-
-    def test_pydantic_invalid_step_type_rejected(self):
-        if not HAS_MODELS:
-            self.skipTest("models not available")
-        bad={"id":"t1","name":"x","team":"team-a","version":1,"status":"draft","steps":[{"id":"s1","type":"not_a_type"}],"transitions":[]}
-        with self.assertRaises(Exception):
-            Track.model_validate(bad)
-
-    def test_llm_json_valid_if_present(self):
-        if not HAS_MODELS:
-            self.skipTest("models not available")
-        for path, data in load_all_tracks():
-            if data.get("llm_config"):
-                try:
-                    LLMConfig.model_validate(data["llm_config"])
-                except Exception as e:
-                    self.fail(f"{path} llm_config invalid: {e}")
-
-# ---------------------------------------------------------------------------
-# 2. Transitions integrity
-# ---------------------------------------------------------------------------
-class TestTransitions(unittest.TestCase):
-    def test_transitions_from_to_exist(self):
-        for path, data in load_all_tracks():
-            step_ids={s["id"] for s in data.get("steps",[])}
-            for t in data.get("transitions",[]):
-                self.assertIn(t["from"], step_ids, f"{path} transition from {t['from']} not found")
-                self.assertIn(t["to"], step_ids, f"{path} transition to {t['to']} not found")
-
-    def test_transitions_have_from_to(self):
-        for path, data in load_all_tracks():
-            for t in data.get("transitions",[]):
-                self.assertIn("from", t)
-                self.assertIn("to", t)
-
-    def test_no_unconditional_cycle(self):
-        for path, data in load_all_tracks():
-            self.assertFalse(has_cycle_without_condition(data.get("steps",[]), data.get("transitions",[])),
-                             f"{path} has unconditional cycle")
-
-    def test_conditional_branch_has_complement(self):
-        """If a condition step branches on '== prod', there should be a complementary branch."""
-        for path, data in load_all_tracks():
-            # just check that condition steps have at least 2 outgoing edges when present
-            from_counts={}
-            for t in data.get("transitions",[]):
-                from_counts[t["from"]]=from_counts.get(t["from"],0)+1
-            for s in data.get("steps",[]):
-                if s.get("type")=="condition":
-                    cnt=from_counts.get(s["id"],0)
-                    self.assertGreaterEqual(cnt, 1, f"{path} condition step {s['id']} has no outgoing")
-
-    def test_has_cycle_helper_detects_cycle(self):
-        steps=[{"id":"a"},{"id":"b"}]
-        trans=[{"from":"a","to":"b"},{"from":"b","to":"a"}]
-        self.assertTrue(has_cycle_without_condition(steps, trans))
-        trans2=[{"from":"a","to":"b","condition":"x==1"},{"from":"b","to":"a","condition":"y==1"}]
-        self.assertFalse(has_cycle_without_condition(steps, trans2))
-
-    def test_self_loop_with_condition_allowed(self):
-        steps=[{"id":"a"},{"id":"b"}]
-        trans=[{"from":"a","to":"a","condition":"retry==true"}]
-        self.assertFalse(has_cycle_without_condition(steps, trans))
 
 # ---------------------------------------------------------------------------
-# 3. Step types / business rules
+# Track format, storage, import/export
 # ---------------------------------------------------------------------------
-class TestStepTypes(unittest.TestCase):
-    def test_step_types_valid(self):
-        for path, data in load_all_tracks():
-            for s in data.get("steps",[]):
-                self.assertIn(s["type"], VALID_STEP_TYPES, f"{path} step {s['id']} type {s['type']}")
 
-    def test_input_steps_have_variable(self):
-        for path, data in load_all_tracks():
-            for s in data.get("steps",[]):
-                if s["type"]=="input":
-                    self.assertIn("variable", s.get("config",{}), f"{path} input {s['id']} missing variable")
+class TestFormat(TempStorage):
+    @needs_partner
+    def test_partner_files_byte_identical_after_load_save(self):
+        t = storage.read_track_dir(PARTNER)
+        storage.save_track(t)
+        out = self.tmp / "tracks" / t.id / PARTNER_ACTIVITY
+        for name in ("metadata.json", "properties.json", "attachments.json"):
+            self.assertEqual((out / name).read_bytes().strip(),
+                             (PARTNER / PARTNER_ACTIVITY / name).read_bytes().strip(), name)
+        self.assertEqual((self.tmp / "tracks" / t.id / "scheme.bpmn").read_text(encoding="utf-8"),
+                         (PARTNER / "scheme.bpmn").read_text(encoding="utf-8"))
 
-    def test_approval_has_approvers(self):
-        for path, data in load_all_tracks():
-            for s in data.get("steps",[]):
-                if s["type"]=="approval":
-                    cfg=s.get("config",{})
-                    # approvers may be present or prompt must exist
-                    self.assertTrue("approvers" in cfg or "prompt" in cfg, f"{path} approval {s['id']} needs approvers/prompt")
+    def test_version_bumps_only_on_change_and_snapshots(self):
+        t = storage.save_track(make_track())
+        self.assertEqual(t.version, 1)
+        self.assertEqual(storage.save_track(storage.load_track("t1")).version, 1)
+        t.activities[t.tasks[0]].metadata["content"] = "<p>новое</p>"
+        self.assertEqual(storage.save_track(t).version, 2)
+        self.assertEqual(storage.list_versions("t1"), [1, 2])
+        self.assertNotIn("новое", storage.load_track("t1", 1).activities[t.tasks[0]].content)
 
-# ---------------------------------------------------------------------------
-# 4. Versioning
-# ---------------------------------------------------------------------------
-class TestVersioning(unittest.TestCase):
-    def test_version_files_exist(self):
-        for path, data in load_all_tracks():
-            tdir=Path(path).parent
-            vfile=tdir / f"v{data['version']}.json"
-            self.assertTrue(vfile.exists(), f"{vfile} missing")
+    def test_removed_activity_folder_deleted(self):
+        t = storage.save_track(make_track())
+        gone = t.tasks[-1]
+        t.activities.pop(gone)
+        storage.save_track(t)
+        self.assertFalse((self.tmp / "tracks" / "t1" / gone).exists())
 
-    def test_version_snapshot_matches_latest(self):
-        for path, data in load_all_tracks():
-            tdir=Path(path).parent
-            vfile=tdir / f"v{data['version']}.json"
-            if not vfile.exists(): continue
-            with open(vfile, encoding="utf-8") as f:
-                snap=json.load(f)
-            self.assertEqual(snap["version"], data["version"])
-            self.assertEqual(snap["id"], data["id"])
+    @needs_partner
+    def test_zip_roundtrip_pure_export(self):
+        t = tracks.sync(storage.read_track_dir(PARTNER))
+        data = tracks.export_zip(t, pure=True)
+        names = zipfile.ZipFile(io.BytesIO(data)).namelist()
+        self.assertIn("scheme.bpmn", names)
+        self.assertIn(f"{PARTNER_ACTIVITY}/metadata.json", names)
+        self.assertFalse([n for n in names if n.endswith(("agent.json", "track.json"))])
+        back = tracks.import_zip(data, "copy")
+        self.assertEqual(back.activities[PARTNER_ACTIVITY].metadata,
+                         json.loads((PARTNER / PARTNER_ACTIVITY / "metadata.json").read_text("utf-8")))
+        self.assertEqual(back.track_uuid, "69c3fb3f-7340-427c-aa53-6f57ad452b50")
 
-    def test_versions_sequential(self):
-        for team_dir in TRACKS_DIR.iterdir():
-            if not team_dir.is_dir(): continue
-            for track_dir in team_dir.iterdir():
-                if not track_dir.is_dir(): continue
-                versions=[]
-                for p in track_dir.glob("v*.json"):
-                    m=re.match(r"v(\d+)\.json", p.name)
-                    if m: versions.append(int(m.group(1)))
-                if versions:
-                    versions.sort()
-                    # versions should be contiguous starting at 1
-                    self.assertEqual(versions[0], 1, f"{track_dir} versions should start at 1")
-                    for i in range(1,len(versions)):
-                        self.assertEqual(versions[i], versions[i-1]+1, f"{track_dir} gap in versions")
+    def test_zip_import_nested_folder_and_garbage(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("export/scheme.bpmn", "\n" + make_track().bpmn)
+            z.writestr("export/tasks.json", "[]")
+            z.writestr("__MACOSX/export/._scheme.bpmn", "junk")
+        t = tracks.sync(tracks.import_zip(buf.getvalue(), "nested"))
+        self.assertEqual(len(t.activities), 4)
+        with self.assertRaises(ValueError):
+            tracks.import_zip(b"not a zip")
 
-    def test_save_track_auto_version(self):
-        if not HAS_MODELS:
-            self.skipTest("models not available")
-        # use temp dir
-        import storage
-        with tempfile.TemporaryDirectory() as tmp:
-            orig_tracks = storage.TRACKS_DIR
-            orig_runs = storage.RUNS_DIR
-            try:
-                storage.TRACKS_DIR = Path(tmp) / "tracks"
-                storage.RUNS_DIR = Path(tmp) / "runs"
-                t=Track(id="test-track", name="Test", team="team-a", version=1, status=TrackStatus.draft,
-                        steps=[Step(id="s1", type="message", config={"text":"hi"})])
-                storage.save_track(t)
-                self.assertEqual(t.version, 1)
-                # save again with changed content -> bump
-                t2=Track(id="test-track", name="Test Changed", team="team-a", version=1, status=TrackStatus.draft,
-                         steps=[Step(id="s1", type="message", config={"text":"hi2"})])
-                storage.save_track(t2)
-                self.assertEqual(t2.version, 2)
-                # save same content -> no bump (must pass current version)
-                t3=Track(id="test-track", name="Test Changed", team="team-a", version=2, status=TrackStatus.draft,
-                         steps=[Step(id="s1", type="message", config={"text":"hi2"})])
-                storage.save_track(t3)
-                self.assertEqual(t3.version, 2)
-            finally:
-                storage.TRACKS_DIR = orig_tracks
-                storage.RUNS_DIR = orig_runs
+    @needs_partner
+    def test_sync_creates_activities_and_keeps_partner_fields(self):
+        t = storage.read_track_dir(PARTNER)
+        self.assertEqual(len(t.activities), 1)
+        s = tracks.sync(t)
+        self.assertEqual(len(s.activities), 46)
+        new = next(a for k, a in s.activities.items() if k != PARTNER_ACTIVITY)
+        self.assertEqual(set(new.metadata), set(t.activities[PARTNER_ACTIVITY].metadata))
+        self.assertEqual(s.bpmn, t.bpmn)
+
+    def test_lint(self):
+        self.assertEqual(tracks.lint(make_track())["errors"], [])
+
+    @needs_partner
+    def test_lint_partner_missing_props(self):
+        lint = tracks.lint(tracks.sync(storage.read_track_dir(PARTNER)))
+        self.assertTrue(any("New_FP" in e for e in lint["errors"]))  # props of missing activities
+
+    def test_fixtures_load(self):
+        for d in sorted((REPO / "tracks").iterdir()):
+            t = storage.read_track_dir(d)
+            if t.status.value == "published":
+                self.assertEqual(tracks.lint(t)["errors"], [], d.name)
+
 
 # ---------------------------------------------------------------------------
-# 5. Run state transitions
+# Engine
 # ---------------------------------------------------------------------------
-class TestRunStates(unittest.TestCase):
-    def test_valid_run_statuses(self):
-        for s in ["active","waiting","completed","failed","cancelled"]:
-            self.assertIn(s, VALID_RUN_STATUSES)
 
-    def test_run_lifecycle_validTransitions(self):
-        allowed={
-            "active": {"waiting","completed","failed","cancelled","active"},
-            "waiting": {"active","completed","failed","cancelled"},
-            "completed": set(),
-            "failed": set(),
-            "cancelled": set(),
-        }
-        # active -> completed is valid, completed -> active is not
-        self.assertIn("completed", allowed["active"])
-        self.assertNotIn("active", allowed["completed"])
+class TestEngine(TempStorage):
+    def setUp(self):
+        super().setUp()
+        self.track = storage.save_track(make_track())
+        self.ids = ids(self.track)
+        self.run = engine.start_run(self.track, "u1", "Иван")
 
-    def test_run_pydantic(self):
-        if not HAS_MODELS:
-            self.skipTest("models not available")
-        r=Run(run_id="r1", user_id="u1", team="team-a", track_id="t1", track_version=1, status=RunStatus.active)
-        self.assertEqual(r.status, RunStatus.active)
-        with self.assertRaises(Exception):
-            Run(run_id="r1", user_id="u1", team="team-a", track_id="t1", track_version=0)
+    def test_start(self):
+        self.assertEqual(self.run.current_step, self.ids["Данные"])
+        with self.assertRaises(engine.RuleError):
+            engine.start_run(make_track("draft"), "u1")
 
-    def test_run_keeps_version_snapshot(self):
-        if not HAS_MODELS:
-            self.skipTest("models not available")
-        import storage
-        with tempfile.TemporaryDirectory() as tmp:
-            orig_tracks = storage.TRACKS_DIR
-            orig_runs = storage.RUNS_DIR
-            try:
-                storage.TRACKS_DIR = Path(tmp)/"tracks"
-                storage.RUNS_DIR = Path(tmp)/"runs"
-                t=Track(id="snap-track", name="Snap", team="team-a", version=1, status=TrackStatus.published,
-                        steps=[Step(id="s1", type="message", config={"text":"v1"})])
-                storage.save_track(t)
-                # simulate start_run snapshot
-                r=Run(run_id="run-snap", user_id="u1", team="team-a", track_id="snap-track", track_version=t.version, current_step="s1")
-                storage.save_run(r)
-                # bump track
-                t2=Track(id="snap-track", name="Snap v2", team="team-a", version=1, status=TrackStatus.published,
-                         steps=[Step(id="s1", type="message", config={"text":"v2"}), Step(id="s2", type="message", config={"text":"new"})])
-                storage.save_track(t2)
-                # run should still reference v1
-                loaded=storage.load_run_any("run-snap")
-                self.assertEqual(loaded.track_version, 1)
-                track_v1=storage.load_track("team-a","snap-track", version=1)
-                self.assertEqual(track_v1.version, 1)
-                self.assertEqual(len(track_v1.steps), 1)
-            finally:
-                storage.TRACKS_DIR=orig_tracks
-                storage.RUNS_DIR=orig_runs
+    def test_required_property_blocks(self):
+        with self.assertRaises(engine.RuleError) as cm:
+            engine.complete(self.run, self.track)
+        self.assertIn("env", str(cm.exception))
+        self.run.facts["env"] = "prod"
+        self.assertEqual(engine.complete(self.run, self.track), self.ids["Проверки"])
 
-    def test_cannot_message_completed_run(self):
-        if not HAS_MODELS:
-            self.skipTest("models not available")
-        r=Run(run_id="r2", user_id="u1", team="team-a", track_id="t1", track_version=1, status=RunStatus.completed)
-        self.assertIn(r.status, [RunStatus.completed])
-        # business rule: completed run rejects message
-        blocked = r.status in (RunStatus.completed, RunStatus.failed, RunStatus.cancelled)
-        self.assertTrue(blocked)
+    def test_requirement_then_branch_by_condition(self):
+        self.run.facts["env"] = "prod"
+        engine.complete(self.run, self.track)
+        with self.assertRaises(engine.RuleError):
+            engine.complete(self.run, self.track)
+        self.run.confirmed[self.run.current_step] = {"ok": "да"}
+        self.assertEqual(engine.complete(self.run, self.track), self.ids["Заявка"])
 
-# ---------------------------------------------------------------------------
-# 6. Validation logic
-# ---------------------------------------------------------------------------
-class TestValidationLogic(unittest.TestCase):
-    def test_regex_validation(self):
-        self.assertTrue(re.match(r"^[A-Z]+-\d+$", "PROJ-123"))
-        self.assertFalse(re.match(r"^[A-Z]+-\d+$", "proj-123"))
+    def test_branch_to_end(self):
+        self.run.facts["env"] = "test"
+        engine.complete(self.run, self.track)
+        self.run.confirmed[self.run.current_step] = {"ok": "да"}
+        self.assertIsNone(engine.complete(self.run, self.track))
+        self.assertEqual(self.run.status, RunStatus.completed)
 
-    def test_required_variable_check(self):
-        track_vars={"team_id":"","story_key":""}
-        # empty required should be detected
-        missing=[k for k,v in track_vars.items() if not v]
-        self.assertIn("team_id", missing)
+    def test_missing_decision_value_reported(self):
+        self.run.facts["env"] = "prod"
+        engine.complete(self.run, self.track)
+        del self.run.facts["env"]
+        self.run.confirmed[self.run.current_step] = {"ok": "да"}
+        missing = engine.missing_for_step(self.run, self.track)
+        self.assertTrue(any("для выбора следующего шага" in m and "env" in m for m in missing))
 
-    def test_condition_evaluator_simple(self):
-        # mirrors backend _next_step logic
-        variables={"env":"prod","approved":"true"}
-        cond="variables.env == 'prod'"
-        parts=[p.strip().strip("'\"") for p in cond.split("==",1)]
-        var_name=parts[0].removeprefix("variables.")
-        expected=parts[1].lower()
-        actual=str(variables.get(var_name,"")).lower()
-        self.assertEqual(actual, expected)
+    def test_jira_send_requires_issue(self):
+        self.run.facts["env"] = "prod"
+        engine.complete(self.run, self.track)
+        self.run.confirmed[self.run.current_step] = {"ok": "да"}
+        engine.complete(self.run, self.track)
+        self.assertIn("не создана задача Jira этого шага", engine.missing_for_step(self.run, self.track))
+        self.run.jira_issues.append(JiraIssueRef(key="REL-1", step_id=self.run.current_step))
+        self.assertEqual(engine.complete(self.run, self.track), self.ids["Установка"])
+
+    def test_go_back_only_to_visited(self):
+        with self.assertRaises(engine.RuleError):
+            engine.go_back(self.run, self.track, self.ids["Заявка"])
+        self.run.facts["env"] = "prod"
+        engine.complete(self.run, self.track)
+        engine.go_back(self.run, self.track, self.ids["Данные"])
+        self.assertEqual(self.run.current_step, self.ids["Данные"])
+
+    def test_coerce(self):
+        props = self.track.props()
+        self.assertEqual(engine.coerce(props["env"], "PROD"), ("prod", None))
+        self.assertIsNotNone(engine.coerce(props["env"], "dev")[1])
+        self.assertEqual(engine.coerce(props["install_ok"], "да"), (True, None))
+        self.assertIsNotNone(engine.coerce({"valueType": "link"}, "confluence")[1])
+        self.assertEqual(engine.coerce({"valueVariants": [{"value": "up", "label": "Доработка"}]},
+                                       "доработка"), ("up", None))
+
+    def test_links_skip_people_and_progress(self):
+        urls = [l.url for l in engine.step_links(self.track, self.ids["Данные"])]
+        self.assertEqual(urls, ["https://wiki.example/doc"])
+        p = engine.progress(self.run, self.track)
+        self.assertEqual(p["current"]["title"], "Данные")
+        self.assertEqual([s["state"] for s in p["steps"]][0], "current")
+        self.assertGreater(p["percent"], -1)
+
+    def test_pinned_version(self):
+        t = storage.load_track("t1")
+        t.name = "Новое имя"
+        storage.save_track(t)
+        self.assertEqual(engine.track_for_run(self.run).name, "Тест")
+
 
 # ---------------------------------------------------------------------------
-# 7. LLM config inheritance
+# Agent with a scripted model
 # ---------------------------------------------------------------------------
-class TestLLMInheritance(unittest.TestCase):
-    def test_global_only(self):
-        g={"provider":"mistral","model":"mistral-small-latest","temperature":0.7}
-        res=resolve_llm_config(g, None, None, None)
-        self.assertEqual(res["model"], "mistral-small-latest")
 
-    def test_track_overrides_global(self):
-        g={"provider":"mistral","model":"mistral-small-latest","temperature":0.7}
-        track={"model":"mistral-large-latest","temperature":0.9}
-        res=resolve_llm_config(g, None, track, None)
-        self.assertEqual(res["model"], "mistral-large-latest")
-        self.assertEqual(res["temperature"], 0.9)
-        self.assertEqual(res["provider"], "mistral")
+def call(name, **args):
+    return {"id": f"c{name[:5]}", "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
 
-    def test_step_overrides_track(self):
-        g={"provider":"mistral","model":"a","temperature":0.5}
-        track={"model":"b","temperature":0.7}
-        step={"temperature":1.0}
-        res=resolve_llm_config(g, None, track, step)
-        self.assertEqual(res["model"], "b")
-        self.assertEqual(res["temperature"], 1.0)
 
-    def test_four_level_chain(self):
-        g={"provider":"mistral","model":"g","temperature":0.5}
-        team={"model":"team-model"}
-        track={"temperature":0.9}
-        step={"model":"step-model"}
-        res=resolve_llm_config(g, team, track, step)
-        self.assertEqual(res["provider"], "mistral")
-        self.assertEqual(res["model"], "step-model")
-        self.assertEqual(res["temperature"], 0.9)
+class ScriptedLLM:
+    """Returns the queued assistant messages in order and records what it was shown."""
 
-    def test_llm_global_config_model(self):
-        if not HAS_MODELS:
-            self.skipTest("models not available")
-        cfg=LLMGlobalConfig(provider="mistral", model="mistral-small-latest", temperature=0.7)
-        self.assertEqual(cfg.temperature, 0.7)
-        with self.assertRaises(Exception):
-            LLMGlobalConfig(temperature=5)
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.seen = []
+
+    def __call__(self, cfg, messages, tools=None, model="", json_mode=False):
+        self.seen.append(messages)
+        return self.replies.pop(0)
+
+
+class TestAgent(TempStorage):
+    def setUp(self):
+        super().setUp()
+        self.track = storage.save_track(make_track())
+        self.ids = ids(self.track)
+        self.run = engine.start_run(self.track, "u1")
+        self.settings = Settings()
+
+    def to_request_step(self):
+        self.run.facts["env"] = "prod"
+        engine.complete(self.run, self.track)
+        self.run.confirmed[self.run.current_step] = {"ok": "да"}
+        engine.complete(self.run, self.track)
+
+    def test_save_and_complete(self):
+        llm = ScriptedLLM({"tool_calls": [call("save_info", data={"Окружение": "Prod"}),
+                                          call("complete_step", summary="данные есть")]},
+                          {"content": "Теперь проверки"})
+        agent.run_turn(self.run, "ставим на прод", self.settings, chat=llm)
+        self.assertEqual(self.run.facts["env"], "prod")
+        self.assertEqual(self.run.current_step, self.ids["Проверки"])
+        self.assertIn("Текущий шаг: Проверки", llm.seen[-1][0]["content"])
+        self.assertIn("Окружение", llm.seen[-1][0]["content"])
+
+    def test_bad_value_rejected_with_hint(self):
+        out = agent.run_tool("save_info", {"data": {"env": "dev"}}, self.run, self.track, self.settings)
+        self.assertNotIn("env", self.run.facts)
+        self.assertIn("допустимые значения", out)
+
+    def test_refusal_reaches_model(self):
+        llm = ScriptedLLM({"tool_calls": [call("complete_step")]}, {"content": "Какое окружение?"})
+        agent.run_turn(self.run, "дальше", self.settings, chat=llm)
+        self.assertEqual(self.run.current_step, self.ids["Данные"])
+        self.assertIn("отказано", llm.seen[-1][-1]["content"])
+
+    def test_decision_listed_in_prompt(self):
+        self.run.facts["env"] = "prod"
+        engine.complete(self.run, self.track)
+        prompt = agent.system_prompt(self.run, self.track, self.settings)
+        self.assertIn("развилка", prompt)
+        self.assertIn("(env) = prod", prompt)
+
+    def test_jira_template_asks_then_creates(self):
+        self.to_request_step()
+        out = agent.run_tool("create_jira_issue", {}, self.run, self.track, self.settings)
+        self.assertIn("window", out)
+        self.run.facts["window"] = "пт 20:00"
+        out = agent.run_tool("create_jira_issue", {}, self.run, self.track, self.settings)
+        self.assertEqual(self.run.jira_issues[0].summary, "Релиз на prod пт 20:00")
+        self.assertIn("REL-1", out)
+
+    def test_jira_send_without_template_uses_agent_summary(self):
+        self.to_request_step()
+        self.track.activities[self.run.current_step].agent.jira = None
+        self.settings.jira.default_project = "OPS"
+        self.assertIn("summary", agent.run_tool("create_jira_issue", {}, self.run, self.track, self.settings))
+        agent.run_tool("create_jira_issue", {"summary": "Заявка"}, self.run, self.track, self.settings)
+        self.assertEqual(self.run.jira_issues[0].key, "OPS-1")
+
+    def test_link_manual_issue_when_jira_unavailable(self):
+        self.to_request_step()
+        self.settings.jira.mode = "server"  # not configured: no base_url
+        self.run.facts["window"] = "пт"
+        self.assertIn("не настроена", agent.run_tool("create_jira_issue", {}, self.run, self.track, self.settings))
+        self.assertIn("ПРОЕКТ-123", agent.run_tool("link_jira_issue", {"issue_key": "rel 5"}, self.run, self.track, self.settings))
+        agent.run_tool("link_jira_issue", {"issue_key": "rel-77"}, self.run, self.track, self.settings)
+        self.assertEqual(self.run.jira_issues[0].key, "REL-77")
+        self.assertEqual(engine.complete(self.run, self.track), self.ids["Установка"])
+
+    def test_link_checks_existence_in_mock(self):
+        self.to_request_step()
+        out = agent.run_tool("link_jira_issue", {"issue_key": "REL-404"}, self.run, self.track, self.settings)
+        self.assertIn("не найдена", out)
+
+    def test_nudge_when_ready_but_not_completed(self):
+        llm = ScriptedLLM({"tool_calls": [call("save_info", data={"env": "test"})]},
+                          {"content": "Идём дальше."},
+                          {"tool_calls": [call("complete_step")]},
+                          {"content": "Проверки: тесты зелёные?"})
+        agent.run_turn(self.run, "test", self.settings, chat=llm)
+        self.assertEqual(self.run.current_step, self.ids["Проверки"])
+        self.assertIn("Служебное", llm.seen[2][-1]["content"])
+
+    def test_no_nudge_when_not_ready(self):
+        llm = ScriptedLLM({"content": "Какое окружение?"})
+        agent.run_turn(self.run, "привет", self.settings, chat=llm)
+        self.assertEqual(len(llm.seen), 1)
+
+    def test_keys_normalized(self):
+        out = agent.run_tool("save_info", {"data": {"target_env": "test", "extra": 1}},
+                             self.run, self.track, self.settings)
+        self.assertEqual(self.run.facts["env"], "test")
+        self.assertEqual(self.run.facts["extra"], 1)
+        self.assertIn("target_env → env", out)
+
+    def test_read_link_only_track_links(self):
+        self.assertIn("только ссылки", agent.run_tool(
+            "read_link", {"url": "http://169.254.169.254/"}, self.run, self.track, self.settings))
+        self.assertIn("только ссылки", agent.run_tool(
+            "read_link", {"url": "https://wiki.example/display/~42"}, self.run, self.track, self.settings))
+
+    def test_content_and_links_in_prompt(self):
+        with mock.patch.object(agent.links, "fetch_text", return_value="СЕКРЕТНОЕ ПРАВИЛО"):
+            prompt = agent.system_prompt(self.run, self.track, self.settings)
+        self.assertIn("СЕКРЕТНОЕ ПРАВИЛО", prompt)
+        self.assertIn("Смотри инструкцию и Иванова", prompt)
+
+    def test_llm_error_becomes_event(self):
+        def boom(*a, **k):
+            raise agent.llm.LLMError("нет ключа")
+        agent.run_turn(self.run, "привет", self.settings, chat=boom)
+        self.assertEqual(self.run.messages[-1].role, "event")
+
+    def test_remember_goes_to_profile(self):
+        llm = ScriptedLLM({"tool_calls": [call("save_info", data={"team": "core"}, remember=True)]},
+                          {"content": "ok"})
+        agent.run_turn(self.run, "я из core", self.settings, chat=llm)
+        self.assertEqual(storage.load_profile("u1"), {"team": "core"})
+
+    def test_draft_from_spec(self):
+        spec = {"id": "draft-x", "name": "Черновик", "steps": [
+            {"id": "s1", "name": "Вопрос", "properties": [{"codeName": "ok", "valueType": "boolean"}],
+             "next": [{"to": "s2", "prop": "ok", "value": True, "name": "Да"},
+                      {"to": "end", "prop": "ok", "value": False, "name": "Нет"}]},
+            {"id": "s2", "name": "Дальше", "type": "jira-send"}]}
+        t = agent.draft_track("процесс", self.settings,
+                              chat=ScriptedLLM({"content": json.dumps(spec, ensure_ascii=False)}))
+        self.assertEqual(len(t.graph.tasks), 2)
+        self.assertEqual(tracks.lint(t)["errors"], [])
+
+
+class TestLinks(unittest.TestCase):
+    def test_html_to_text(self):
+        text = agent.links.html_to_text("<ol><li><p>раз</p></li><li><p>два</p></li></ol><script>x()</script>")
+        self.assertIn("1. раз", text)
+        self.assertIn("2. два", text)
+        self.assertNotIn("x()", text)
+
 
 # ---------------------------------------------------------------------------
-# 8. Business rules
+# API
 # ---------------------------------------------------------------------------
-class TestBusinessRules(unittest.TestCase):
-    def test_published_cannot_be_deleted_rule(self):
-        # helper enforces: if status == published -> delete should be blocked
-        def can_delete(track): return track.get("status") != "published"
-        self.assertFalse(can_delete({"status":"published"}))
-        self.assertTrue(can_delete({"status":"draft"}))
-        self.assertTrue(can_delete({"status":"archived"}))
 
-    def test_archived_track_not_startable(self):
-        # business rule helper
-        def can_start(track): return track.get("status") in ("draft","published")
-        self.assertFalse(can_start({"status":"archived"}))
-        self.assertTrue(can_start({"status":"published"}))
+class TestAPI(TempStorage):
+    def setUp(self):
+        super().setUp()
+        self.client = TestClient(main.app)
+        self.llm = ScriptedLLM(*[{"content": f"ответ {i}"} for i in range(10)])
+        self.patch = mock.patch.object(agent.llm, "chat", self.llm)
+        self.patch.start()
 
-    def test_version_snapshot_file_exists_for_run(self):
-        # run keeps version snapshot - verify at least one version file per track
-        for path, data in load_all_tracks():
-            tdir=Path(path).parent
-            vfiles=list(tdir.glob("v*.json"))
-            self.assertGreaterEqual(len(vfiles), 1, f"{tdir} no version snapshots")
+    def tearDown(self):
+        self.patch.stop()
+        super().tearDown()
 
-    def test_config_llm_inheritance_doc(self):
-        # document expectation: inheritance order Global->Team->Track->Step
-        order=["global","team","track","step"]
-        self.assertEqual(order, ["global","team","track","step"])
+    def body(self, t: Track):
+        d = t.model_dump(mode="json")
+        return {k: d[k] for k in ("id", "name", "description", "agent_instructions", "model",
+                                  "bpmn", "tasks", "activities")}
+
+    def test_create_from_template_edit_publish(self):
+        c = self.client
+        r = c.post("/api/tracks", json={"id": "new", "name": "Новый"})
+        self.assertEqual(r.status_code, 201)
+        t = r.json()["track"]
+        self.assertEqual(len(t["tasks"]), 1)
+        self.assertEqual(c.post("/api/tracks", json={"id": "new", "name": "x"}).status_code, 409)
+        # the editor adds a plain bpmn:task and marks it jira-send
+        xml = t["bpmn"].replace('<bpmn:startEvent id="StartEvent_1">',
+                                '<bpmn:task id="Activity_0added1" name="Добавлен" />\n    <bpmn:startEvent id="StartEvent_1">')
+        body = {**{k: t[k] for k in ("id", "name", "bpmn", "tasks", "activities")},
+                "bpmn": xml, "task_types": {"Activity_0added1": "jira-send"}}
+        r = c.put("/api/tracks/new", json=body).json()
+        self.assertEqual(r["track"]["version"], 2)
+        self.assertIn("Activity_0added1", r["track"]["activities"])
+        self.assertEqual(r["track"]["activities"]["Activity_0added1"]["metadata"]["type"], "jira-send")
+        self.assertIn("serviceTask id=\"Activity_0added1\"", r["track"]["bpmn"])
+        self.assertTrue(any("исходящий" in e for e in r["lint"]["errors"]))  # not connected yet
+        self.assertEqual(c.post("/api/tracks/new/publish").status_code, 400)
+        self.assertEqual(c.delete("/api/tracks/new").status_code, 200)
+
+    def test_publish_rejects_lint_errors(self):
+        t = make_track("draft")
+        xml = t.bpmn.replace('<bpmn:startEvent id="StartEvent_1">', '<bpmn:startEvent id="StartEvent_x">', 1)
+        self.client.post("/api/tracks", json={**self.body(t), "bpmn": xml})
+        self.assertEqual(self.client.post("/api/tracks/t1/publish").status_code, 400)
+
+    def test_import_export(self):
+        c = self.client
+        data = tracks.export_zip(make_track(), pure=True)
+        r = c.post("/api/tracks/import?id=partner", content=data)
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(len(r.json()["track"]["activities"]), 4)
+        self.assertEqual(c.post("/api/tracks/import?id=partner", content=data).status_code, 409)
+        self.assertEqual(c.post("/api/tracks/import?id=partner&replace=true", content=data).status_code, 201)
+        self.assertEqual(c.post("/api/tracks/import", content=b"junk").status_code, 422)
+        z = c.get("/api/tracks/partner/export?pure=true")
+        self.assertEqual(z.headers["content-type"], "application/zip")
+        self.assertIn("scheme.bpmn", zipfile.ZipFile(io.BytesIO(z.content)).namelist())
+
+    def test_run_chat_stats(self):
+        c = self.client
+        c.post("/api/tracks", json=self.body(make_track()))
+        c.post("/api/tracks/t1/publish")
+        self.assertEqual(len(c.get("/api/catalog").json()), 1)
+        v = c.post("/api/runs", json={"track_id": "t1", "user_id": "u1", "user_name": "Иван"}).json()
+        rid = v["run"]["run_id"]
+        self.assertEqual(v["progress"]["current"]["title"], "Данные")
+        v = c.post(f"/api/runs/{rid}/messages", json={"text": "привет"}).json()
+        self.assertEqual(v["run"]["messages"][-1]["text"], "ответ 1")
+        ov = c.get("/api/stats/overview").json()
+        self.assertEqual(ov["in_progress"][0]["current_step_title"], "Данные")
+        st = c.get("/api/stats/tracks/t1").json()
+        self.assertEqual(st["steps"][0]["active_now"], 1)
+        self.assertEqual(c.post(f"/api/runs/{rid}/cancel").json()["run"]["status"], "cancelled")
+
+    def test_lint_endpoint_and_bad_scheme(self):
+        t = make_track()
+        self.assertEqual(self.client.post("/api/tracks/lint", json=self.body(t)).json()["errors"], [])
+        bad = self.client.post("/api/tracks/lint", json={**self.body(t), "bpmn": "<x"}).json()
+        self.assertTrue(bad["errors"])
+
+    def test_settings_masked_and_token(self):
+        s = Settings().model_dump()
+        s["agent"]["api_key"] = "k"
+        self.assertEqual(self.client.put("/api/settings", json=s).json()["agent"]["api_key"], "••••••••")
+        with mock.patch.dict("os.environ", {"ANALYST_TOKEN": "t0k"}):
+            self.assertEqual(self.client.get("/api/tracks").status_code, 401)
+            self.assertEqual(self.client.get("/api/catalog").status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

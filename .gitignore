@@ -14,11 +14,13 @@ venv/
 *.key
 *.pem
 
-# Runtime data - don't commit runs, n8n state
+# Runtime data: runs, remembered user facts, analyst settings (contain API keys), Jira mock
 runs/
-data-track/
+runs_legacy/
+users/
+config/settings.json
+config/jira_mock.json
 data/
-workflows/state/
 *.log
 *.db
 .DS_Store
@@ -29,5 +31,11 @@ workflows/state/
 *.swp
 *.swo
 
-# Node
-node_modules/
+
+# Partner system data (internal links, employee names): local only, never pushed
+/scheme.bpmn
+/tasks.json
+/Activity_*/
+tests/fixtures/partner/
+tracks/openshift-pkap/
+track_versions/openshift-pkap/

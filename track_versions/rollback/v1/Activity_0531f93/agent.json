@@ -1,0 +1,14 @@
+{
+  "requirements": [
+    {
+      "id": "done",
+      "text": "Откат выполнен, сервис работает"
+    }
+  ],
+  "jira": {
+    "project": "REL",
+    "summary": "Откат {version} на {env}",
+    "description": "Причина: {reason}",
+    "required": false
+  }
+}

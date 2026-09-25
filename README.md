@@ -1,103 +1,54 @@
-# n8n Track Platform
+# Track Platform
 
-Track-based orchestration for n8n: define multi-step workflows (tracks) per team, run them via chat/API, drive execution with n8n webhooks.
+ИИ-агент ведёт пользователя по треку, то есть по пошаговому процессу вроде установки релиза, хотфикса или онбординга. Аналитик собирает треки в визуальном редакторе и видит, кто на каком этапе и сколько времени занимает каждый этап.
 
-## Architecture
+## Два интерфейса
 
-```
-                ┌─────────────────┐
-                │   Frontend SPA   │  :19001 /  (static)
-                │ index.html+js+css│
-                └────────┬────────┘
-                         │ fetch
-                ┌────────▼────────┐
-                │  Backend (FastAPI) │  :19001 /api
-                │  backend/main.py   │──► tracks/{team}/{id}/track.json + v{N}.json
-                │  backend/storage.py│──► runs/{team}/{run_id}.json
-                └────────┬────────┘  └──► config/llm.json, config/teams.json
-                         │ webhook
-                ┌────────▼────────┐
-                │   n8n workflows  │  POST /api/runs/{id}/advance
-                │   (triggered)    │
-                └─────────────────┘
-                ┌─────────────────┐
-                │ File Server :19099│  GET /read?path=  POST /write?path=
-                └─────────────────┘
-```
+| Адрес | Для кого | Что внутри |
+|---|---|---|
+| `/` | пользователь | каталог треков, «Продолжить» для незавершённых прохождений, чат с агентом, прогресс по шагам, текущий шаг с материалами, условиями и задачами Jira |
+| `/analyst.html` | аналитик | обзор (кто где сейчас, самые долгие этапы), треки (редактор, схема, версии, генерация черновика из описания), статистика трека, прохождения с полным диалогом, настройки агента, Jira и Confluence |
 
-**State:** filesystem JSON only (no DB). `Track.version` is auto-incremented on content change; each save writes `v{N}.json`. `Run.track_version` is snapshotted at start and pinned to that version.
-
-## Quick Start
+## Запуск
 
 ```bash
 pip install -r backend/requirements.txt
-uvicorn backend.main:app --host 0.0.0.0 --port 19001 --reload
-# file server (for n8n HTTP Request nodes)
-python3 files/file_server.py  # :19099
-# docker (backend + file-server + optional n8n)
-docker compose up -d backend file-server
-docker compose --profile isolated up -d  # + n8n on :5680
-
-# deploy n8n workflows (if workflows/deploy.py present)
-python workflows/deploy.py
+MISTRAL_API_KEY=... uvicorn backend.main:app --host 0.0.0.0 --port 19001 --reload
+# или
+docker compose up -d
 ```
 
-Open http://localhost:19001 — frontend served by backend StaticFiles mount.
+Откройте http://localhost:19001 и http://localhost:19001/analyst.html. Ключ агента, URL, модель, Jira и Confluence настраиваются в кабинете аналитика в разделе «Настройки». Переменная `MISTRAL_API_KEY` (или `AGENT_API_KEY`) нужна только как запасной ключ. Если задан `ANALYST_TOKEN`, API аналитика требует заголовок `X-Analyst-Token`.
 
-## API Docs
+## Формат трека (совместим с партнёрской системой)
 
-Interactive docs at `/docs` (FastAPI Swagger). Base URL `http://localhost:19001`.
+Трек хранится в той же структуре, что и в партнёрской системе, поэтому его папку можно переносить между системами без конвертации:
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/api/health` | Health check |
-| POST | `/api/tracks` | Create/update track (body: `CreateTrackRequest`) |
-| GET | `/api/tracks?team=` | List tracks (optional filter) |
-| GET | `/api/tracks/{team}/{id}?version=` | Get track (latest or versioned) |
-| GET | `/api/tracks/{team}/{id}/versions` | List versions |
-| POST | `/api/tracks/{team}/{id}/publish` | Publish (sets status=published, bumps version file) |
-| DELETE | `/api/tracks/{team}/{id}` | Delete track directory |
-| POST | `/api/runs/start` | Start run `{track_id, team, user_id, variables?}` |
-| GET | `/api/runs?team=&user_id=` | List runs |
-| GET | `/api/runs/{id}?team=` | Get run |
-| POST | `/api/runs/{id}/message` | User message `{text, user_id?, payload?}` — appends history, auto-advances via transitions |
-| POST | `/api/runs/{id}/advance` | n8n webhook `{target_step?, variables?, status?, text?}` |
-| GET | `/api/teams` | List teams (from config + discovered) |
-| GET | `/api/config/llm` | Get global LLM config |
-| PUT | `/api/config/llm` | Save global LLM config |
+```
+tracks/<id>/
+  scheme.bpmn              схема BPMN 2.0 (Camunda): шаги, шлюзы, переходы, группы-этапы
+  tasks.json               список ID шагов
+  Activity_xxxxxxx/
+    metadata.json          название, описание (HTML tiptap), тип, оценка времени…
+    properties.json        свойства, которые заполняет пользователь (codeName, valueType, варианты)
+    attachments.json
+    agent.json             только у нас: инструкции агенту, обязательные условия, шаблон Jira
+  track.json               только у нас: статус, версия, общие инструкции агенту
+```
 
-**LLM inheritance:** `Global (config/llm.json) → Team → Track.llm_config → Step.config.llm` — later overrides former, non-null fields win.
+- **Шаг** — задача `serviceTask` с `taskType` `task` или `jira-send`. На шагах `jira-send` без задачи в Jira дальше пройти нельзя.
+- **Ветвление** — шлюз и переходы с условиями `${objProps.prop("код").value() == значение}`. Следующий шаг выбирает сервер по значениям свойств, не модель. Если значения не хватает, агент спрашивает его у пользователя.
+- **Этап** — группа на схеме. Этапы видны пользователю в прогрессе и аналитику в статистике.
+- Файлы партнёрской системы при загрузке и сохранении не меняются. Неизвестные поля (`jiraSendTask`, `waitTask`, `sberTrackSendTask`…) хранятся как есть. Наши дополнения лежат в отдельных `agent.json` и `track.json`, партнёрская система их не видит.
 
-**Run history types:** `message | system | step_enter | step_exit`.
+**Импорт и экспорт.** В разделе «Треки» есть кнопка «Импорт»: она принимает zip-архив из партнёрской системы. Для шагов без папки `Activity_*` создаются пустые описания. В редакторе есть кнопка «Экспорт» с двумя вариантами: «для партнёрской системы» (только их файлы) и полный архив.
 
-## Frontend
+**Редактор.** Схема рисуется и правится на холсте bpmn-js (лежит локально в `frontend/vendor/bpmn-js`). Для выбранного шага справа настраиваются название, тип, описание, свойства и данные для агента. Для перехода из шлюза настраивается условие: выбор свойства и значения.
 
-`frontend/` — vanilla JS SPA (no build):
-- **Left:** track list grouped by team, filter.
-- **Center:** chat — select track → Start run → first step message → input → POST message → bot reply; progress updates.
-- **Right:** step list with `completed/current/pending` dots + variables + mini history.
-- **Admin tab:** Tracks editor (list, create, edit JSON, SVG graph, step cards, transition editor), Publish button, LLM config editor.
+**Агент.** Агент читает описание шага и открывает ссылки из него (упоминания людей пропускает). Он собирает свойства, подтверждает условия, создаёт задачу Jira или привязывает созданную вручную и завершает шаг. Всё, что сказал пользователь, хранится в прохождении и попадает в контекст на каждом шаге. Прохождение можно прервать и продолжить. Оно закреплено за версией трека, с которой началось (снимки версий лежат в `track_versions/`).
 
-API base is `http://localhost:19001`.
-
-## Tests
+## Тесты
 
 ```bash
-python3 -m unittest tests.test_tracks -v
-```
-
-40+ tests: schema, transitions, step types, versioning, run states, LLM inheritance, business rules.
-
-## Folder Structure
-
-```
-backend/         FastAPI + storage.py + models.py (Pydantic)
-frontend/        index.html, app.js, style.css
-files/           file_server.py :19099
-tracks/{team}/{id}/  track.json + vN.json
-runs/{team}/     {run_id}.json
-config/          llm.json, teams.json
-workflows/       n8n workflow definitions
-tests/           test_tracks.py
-docker-compose.yml
+python3 -m unittest discover -s tests -t . -v
 ```

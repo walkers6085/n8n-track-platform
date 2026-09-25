@@ -1,0 +1,10 @@
+{
+  "jira": {
+    "project": "REL",
+    "summary": "Установка {team} {version} на {env}",
+    "description": "Команда: {team}\nИстория: {story_key}\nВерсия: {version}\nОкружение: {env}\nОкно: {window}",
+    "labels": [
+      "release"
+    ]
+  }
+}

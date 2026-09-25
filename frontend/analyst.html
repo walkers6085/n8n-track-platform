@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Кабинет аналитика</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%233b5bdb'/><path d='M9 22V14M16 22V9M23 22v-5' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>">
+  <link rel="stylesheet" href="vendor/bpmn-js/diagram-js.css">
+  <link rel="stylesheet" href="vendor/bpmn-js/bpmn-js.css">
+  <link rel="stylesheet" href="vendor/bpmn-js/bpmn-embedded.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/"><span class="logo">≡</span>Треки · аналитик</a>
+    <span class="spacer"></span>
+    <a class="btn ghost" href="index.html" target="_blank">Интерфейс пользователя ↗</a>
+  </header>
+  <div class="shell">
+    <nav class="nav">
+      <a href="#/" data-nav="overview"><svg class="ico" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Обзор</a>
+      <a href="#/tracks" data-nav="tracks"><svg class="ico" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M8.5 6h3a4 4 0 0 1 4 4M8.5 18h3a4 4 0 0 0 4-4"/></svg>Треки</a>
+      <a href="#/runs" data-nav="runs"><svg class="ico" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M17 11l2 2 4-4"/></svg>Прохождения</a>
+      <a href="#/settings" data-nav="settings"><svg class="ico" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>Настройки</a>
+    </nav>
+    <main class="main" id="app"></main>
+  </div>
+  <script src="common.js"></script>
+  <script src="vendor/bpmn-js/bpmn-modeler.production.min.js"></script>
+  <script src="editor.js"></script>
+  <script src="analyst.js"></script>
+</body>
+</html>

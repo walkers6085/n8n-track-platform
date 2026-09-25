@@ -1,0 +1,1 @@
+[{"id":"66cd7656-2ac7-4a4d-9983-f8a58c818368","name":"Кто согласовал","codeName":"approved_by","description":"Кто из релиз-менеджеров согласовал установку","isArtifact":false,"isEditableInTaskOnly":true,"requiredToFillOut":true,"valueType":"string","valueVariants":[],"trackId":"1c87a6bd-71d1-488b-8914-ab072329cca4","isUnused":false}]

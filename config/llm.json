@@ -1,9 +1,0 @@
-{
-  "provider": "mistral",
-  "model": "mistral-small-latest",
-  "temperature": 0.7,
-  "api_key_configured": false,
-  "base_url": null,
-  "max_tokens": null,
-  "extra": {}
-}
